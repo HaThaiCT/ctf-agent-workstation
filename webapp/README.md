@@ -7,7 +7,7 @@ A web application that uses AI coding agents (Claude Code and Codex) to solve CT
 ```
 webapp/
   app.py              # Starlette backend (API + WebSocket)
-  start.sh            # Startup script (generates creds, TLS cert)
+  start.sh            # Passwordless local launcher
   ctf-solver.service  # systemd unit file
   static/
     index.html         # Single-page app
@@ -17,7 +17,14 @@ webapp/
 
 The backend runs provider-specific SDK/CLI integrations, normalizes their event streams into a shared UI format, and persists challenge state to `/root/ctf-agent-wrapper/state` so solver metadata stays out of challenge working directories.
 
-Domain skills live in `/root/ctf-agent-wrapper/skills/`. `install_scripts/013_install-skills.sh` builds `/root/ctf-agent-wrapper/all-skills/`, and the web app symlinks the selected skills into each run workspace under `.claude/skills` and `.codex/skills`.
+Skills are automatically discovered from the checkout, a one-time category cache,
+and app-root uploads/catalogs. Auto is the new-install default; leave it enabled
+to select related workflows by challenge category/file type. Manual remains an
+advanced exact override. Each fresh/resumed run and Advisor turn receives selected
+skills plus the bundled `ctf_gdb` MCP without editing global client configuration.
+Settings → Runtime resources shows source errors and availability; the run feed
+shows actual native MCP connection states. GDB/MCP 2.x must be installed; other
+tool-specific skills still depend on the corresponding binary/licensed tools.
 
 ## Setup
 
@@ -26,7 +33,7 @@ Domain skills live in `/root/ctf-agent-wrapper/skills/`. `install_scripts/013_in
 - Python 3.12+ with `starlette` and `uvicorn`
 - Claude Code CLI (`claude`) — install via `install_scripts/003_install-claude-code.sh`
 - Codex CLI (`codex`) — install via `install_scripts/010_install-codex.sh`
-- At least one agent authenticated (`claude auth login` or `codex login`)
+- Local 9router daemon, API key, and native launcher/model metadata (auto-discovered from existing `9router-clients` installations); native account login is not required.
 
 ### Running
 
@@ -39,28 +46,45 @@ sudo cp ctf-solver.service /etc/systemd/system/
 sudo systemctl enable --now ctf-solver
 ```
 
-The app starts on `https://0.0.0.0:443` with a self-signed TLS certificate. The password is printed to stdout on first run and stored in `/root/.ctf-solver-password`.
+The app opens directly at `http://127.0.0.1:8000`, without login, a web password,
+session cookies, or CSRF tokens. The launcher creates no credentials/TLS files and
+does not kill unrelated native agents. Root deployments retain
+`/root/ctf-agent-wrapper`; non-root launches default to
+`~/.local/share/ctf-agent-workstation/data`. `APP_ROOT_DIR` can select existing data.
+
+Do not expose this passwordless agent UI publicly: native agents execute shell
+commands on the host. Browser writes/WebSockets retain automatic same-origin checks
+and normal input validation remains. For a remote VM, forward SSH port 8000 instead.
 
 ## Features
 
 ### Agent Support
 
-Supported providers:
+Both native harnesses use **9router** as their only model provider:
 
-| Provider | Command shape | Output mode | Model examples |
-|---|---|---|---|
-| Claude Code | `claude -p --dangerously-skip-permissions` | `stream-json` | Hardcoded list: Provider default, Opus, Sonnet, Haiku |
-| Codex | `codex exec --json --dangerously-bypass-approvals-and-sandbox` | raw JSON events | Provider default plus models from local Codex cache/config |
+| Harness | Integration | Model catalog |
+|---|---|---|
+| Claude Code | `claude-agent-sdk`, native CLI | Gateway `GET /v1/models` |
+| Codex | Native `codex app-server`, JSON-RPC over stdio | Same gateway catalog, private native metadata snapshot |
 
-The backend keeps challenge creation, retry, stop, and steer behavior consistent across providers while mapping each CLI's native event stream into the same UI model.
+Settings → **Model provider: 9router** provides URL/key repair and model refresh.
+The default endpoint is `http://127.0.0.1:20128/v1`. Saved keys take precedence over
+`NINEROUTER_API_KEY`, then discovered key files. Blank key input keeps the current
+source; refresh reads key files again for rotation. Keys stay out of public APIs
+and run metadata. Old private credential entries are retained, not used as fallback.
 
-For Claude, the model dropdown is now a fixed list (`Provider default`, `opus`, `sonnet`, `haiku`) and includes an optional effort selector (`low`, `medium`, `high`, `max`).
+Create, bulk upload, platform import, Add Agent, Settings, and Advisor share exact
+model IDs and model-specific effort menus. Unsupported explicit effort is an error,
+not silently dropped. Blank effort keeps the harness/provider default; managed
+variants disable the selector and explain why caller control is unavailable.
+Settings remember enabled harness presets; parallel rows independently choose
+models and efforts on the same harness. Resume keeps the stored tuple.
+Legacy IDs absent from 9router remain in history and cannot resume; use Add Agent
+to create a new run with a valid gateway selection.
 
-For Codex, the model dropdown is populated from `~/.codex/models_cache.json` and `~/.codex/config.toml`, so the UI reflects the machine's cached Codex model catalog and configured default. Codex also exposes an effort selector and maps it to `-c model_reasoning_effort="..."` when launching `codex exec`.
-
-Codex effort forwarding is compatibility-guarded: if a model/effort combination is not supported by the local Codex model cache, the backend omits the effort override and falls back to provider defaults instead of failing the run.
-
-The effort dropdown appears only for providers that this integration can map directly to CLI effort controls.
+Launcher discovery avoids syncing wrappers and child settings never rewrite
+`~/.claude/settings.json` or `~/.codex/config.toml`. Select **Local** for runs:
+host-local 9router cannot be reached by swarm workers.
 
 ### Default Agent Toggle
 
@@ -96,11 +120,11 @@ Automatically scans agent output for flag patterns (`flag{...}`, `CTF{...}`, `HT
 
 ### Usage Page
 
-Accessible via the "Usage" button in the dashboard header. Shows per-agent stats:
+Accessible via the "Usage" button in the dashboard header:
 
-- **Claude** — Auth info (email, plan, org), total sessions/messages, token usage by model (from `~/.claude/stats-cache.json`), daily activity bar chart
-- **Codex** — Auth status inferred from `~/.codex/auth.json`, cached auth method, stored session count
-- **Challenges** — Per-agent totals: challenges attempted, solved, failed, average and total duration
+- **9router** — Catalog connectivity, key source/configuration repair, and Refresh.
+- **Harnesses** — Launcher availability/catalog readiness, not inference proof or native account quota.
+- **Challenges** — Per-harness attempted/solved/failed counts and average/total duration.
 
 ### Other Features
 
@@ -115,9 +139,10 @@ Accessible via the "Usage" button in the dashboard header. Shows per-agent stats
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/login` | Authenticate with password |
-| POST | `/api/logout` | Clear session |
-| GET | `/api/usage` | Agent auth status and usage stats |
+| GET | `/api/usage` | Gateway/harness readiness and per-harness challenge stats |
+| GET | `/api/agents` | Dynamic model/effort metadata; `?refresh=1` refreshes |
+| GET | `/api/agents/gateway` | Public gateway configuration/status (no raw key) |
+| PUT | `/api/agents/gateway` | Save URL/key and refresh status (no login/token; same-origin browser writes) |
 | GET | `/api/settings` | Get global settings |
 | PUT | `/api/settings` | Update global settings (agents, theme, import size cap, Discord) |
 | GET | `/api/challenges` | List all challenges |

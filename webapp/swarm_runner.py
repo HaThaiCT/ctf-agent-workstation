@@ -13,15 +13,13 @@ Control channel: JSON lines on stdin. Currently supports ``{"cmd": "stop"}``,
 which asks the run to wind down (mirrors the controller's ``_stop_reason``).
 
 This module reuses the full webapp's workspace + provider helpers, so behaviour
-matches local execution exactly. Importing ``app`` requires APP_PASSWORD and
-SESSION_SECRET; we set throwaway values if absent since no server is started.
+matches local execution exactly; no HTTP server is started by this helper.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
 
 
@@ -36,9 +34,6 @@ def _emit(event: dict) -> None:
 
 
 def _load_app():
-    # app.py reads these at import time and hard-fails if unset.
-    os.environ.setdefault("APP_PASSWORD", "swarm-worker")
-    os.environ.setdefault("SESSION_SECRET", "x" * 48)
     try:
         from . import app as app_mod
     except ImportError:

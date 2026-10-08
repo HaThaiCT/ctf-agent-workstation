@@ -7,5 +7,6 @@ output "external_ip" {
 }
 
 output "webapp_url" {
-  value = "https://${digitalocean_droplet.ctf.ipv4_address}"
+  value       = "http://127.0.0.1:8000"
+  description = "Open locally after forwarding SSH port 8000 to the VM."
 }

@@ -1,209 +1,212 @@
-# ctf-agent-orchestrator
+# CTF Agent Orchestrator (CTF Solver Workstation)
 
-An AI-powered CTF solving workstation. It provisions a cloud VM pre-loaded with reverse-engineering, forensics, crypto, pwn, and web tooling, then lets you throw CTF challenges at one or more AI agents — **Claude Code** and **Codex** — through a web UI. Run a single agent, race several in parallel, or fan challenges out to a fleet of disposable worker VMs.
+Hệ thống trạm làm việc (Workstation) tự động hóa giải thử thách CTF (Capture The Flag) ứng dụng trí tuệ nhân tạo (AI Agent). Nền tảng tích hợp sẵn kho công cụ an ninh mạng thực tế (Reverse Engineering, Pwn/Exploitation, Forensics, Crypto, Web), cho phép điều phối các AI Agent hàng đầu — **Claude Code** và **Codex** — thông qua giao diện Web thời gian thực hoặc Discord Bot.
 
 ```
-┌──────────┐   challenge    ┌─────────────────────┐   spawns    ┌──────────────┐
-│ Web UI / │ ─────────────► │  Webapp (Starlette) │ ──────────► │ Claude / Codex│
-│ Discord  │ ◄───────────── │  state · streaming  │ ◄────────── │ + full toolkit│
-└──────────┘   live stream  └─────────────────────┘   events    └──────────────┘
+┌─────────────────┐       Tạo / Chọn bài       ┌────────────────────────┐      Thực thi Native      ┌─────────────────────────────┐
+│  Web UI 8000 /  │ ─────────────────────────► │   Webapp (Starlette)   │ ────────────────────────► │ Claude Code / Codex (Local) │
+│   Discord Bot   │ ◄───────────────────────── │ State · JSONL · Stream │ ◄──────────────────────── │  + Bộ công cụ CTF & GDB MCP │
+└─────────────────┘      WebSocket Stream      └────────────────────────┘       Events / Tool calls └─────────────────────────────┘
+                                                           │
+                                                           ▼
+                                                ┌───────────────────────┐
+                                                │ 9router Local (:20128)│
+                                                │ Quản lý Model & Effort│
+                                                └───────────────────────┘
 ```
 
-## Why
+---
 
-Modern AI agents can solve many CTF challenges autonomously — the bottleneck is usually *environment*, not intelligence. An agent needs binutils, disassemblers, debuggers, forensics suites, network tools, and a sandbox where it can run freely. This project provisions that environment once, then exposes challenges to agents that can execute commands, read/write files, collaborate, and iterate until they find the flag.
+## Mục lục
 
-Agents are effective out of the box, but get better with **skills** — structured, version-controlled workflows that guide how to approach each challenge type (forensics, reversing, crypto, pwn, web, …). When you catch an agent down a rabbit hole or missing an obvious technique, you encode that lesson into a skill so it doesn't repeat the mistake. The skill library compounds over time and the solve rate climbs.
+1. [Tổng quan & Nguyên lý hoạt động](#1-tổng-quan--nguyên-lý-hoạt-động)
+2. [Chi tiết các tính năng chính](#2-chi-tiết-các-tính-năng-chính)
+   - [2.1. Cổng định tuyến AI Model (9router Gateway)](#21-cổng-định-tuyến-ai-model-9router-gateway)
+   - [2.2. Khởi tạo phiên 2 lượt (Two-Turn Persona Initiation)](#22-khởi-tạo-phiên-2-lượt-two-turn-persona-initiation)
+   - [2.3. Quản lý thử thách & Phiên giải (Challenge Lifecycle)](#23-quản-lý-thử-thách--phiên-giải-challenge-lifecycle)
+   - [2.4. Chế độ giải bài & Phối hợp đồng đội (Single & Parallel Racing)](#24-chế-độ-giải-bài--phối-hợp-đồng-đội-single--parallel-racing)
+   - [2.5. Hệ thống Kỹ năng (CTF Skills) & Debugger MCP](#25-hệ-thống-kỹ-năng-ctf-skills--debugger-mcp)
+   - [2.6. Giao diện Web thời gian thực (Real-time Web UI)](#26-giao-diện-web-thời-gian-thực-real-time-web-ui)
+   - [2.7. Trợ lý cố vấn chiến thuật (Advisor AI)](#27-trợ-lý-cố-vấn-chiến-thuật-advisor-ai)
+   - [2.8. Tích hợp Discord Bot](#28-tích-hợp-discord-bot)
+3. [Tài nguyên hệ thống & Mức độ chiếm dụng](#3-tài-nguyên-hệ-thống--mức-độ-chiếm-dụng)
+4. [Cài đặt & Khởi chạy nhanh](#4-cài-đặt--khởi-chạy-nhanh)
+5. [Cấu trúc thư mục dự án](#5-cấu-trúc-thư-mục-dự-án)
 
-## Features
+---
 
-**Agents & solving**
-- **Claude Code and Codex**, via their native SDK/integration paths. Pick model and reasoning effort per agent.
-- **Parallel mode** — add multiple agent rows to race the same challenge. Each agent gets an isolated workspace and shares validated breakthroughs through working notes and the `notify_teammates` tool.
-- **Steering** — send mid-solve guidance; the agent resumes from its current session with your message.
-- **Resume / Retry / Solve / Unsolve** — resume from saved session state, restart fresh, or manually override status.
-- **Advisor** — a per-challenge conversational agent that reads the solvers' live transcripts, answers your questions, researches techniques/CVEs online, and can relay concise hints to the running solvers.
+## 1. Tổng quan & Nguyên lý hoạt động
 
-**Web UI**
-- **Live streaming** over WebSocket — thinking blocks, tool calls, results, and text with syntax highlighting and collapsible sections; split or tabbed views for parallel runs.
-- **Flag detection** — auto-detects `flag{…}`, `CTF{…}`, `HTB{…}`, `picoCTF{…}`, and custom formats. A silent `ctfgrep` preflight over challenge files surfaces candidate flags before the agent even starts.
-- **Auto-submit** — detected flags can be submitted to the connected platform; a correct flag marks the challenge solved and stops sibling runs.
-- **File browser** — inspect original challenge files and per-run workspaces (images, syntax-highlighted text, hex for binaries).
-- **Usage & statistics** — per-agent account/usage dashboards and per-challenge token/cost/duration/turn breakdowns.
-- **Export** — download a markdown report with the full activity log.
+Nhiều AI Agent hiện nay có khả năng suy luận và khai thác lỗ hổng rất tốt, nhưng nút thắt lớn nhất là **môi trường thực thi**. Một agent cần quyền truy cập shell Linux thật, các trình dịch ngược, trình gỡ lỗi, thư viện phân tích mã nhị phân, và khả năng chạy các script khai thác mà không bị hạn chế bởi sandbox hẹp.
 
-**Challenge management**
-- **Single, bulk (`.zip`/`.7z`), and platform import.** Pull challenges directly from **CTFd, rCTF, Hack The Box CTF, CDDC, Cywaria/Cympire, and SAS CTF**; saved connections re-sync for new challenges, points, and solves.
-- **On-demand instances** — HTB, Cywaria, and SAS CTF challenges with Docker/machine instances are started at solve time and their connection info is injected into the prompt.
-- **Per-challenge / per-run skills** — set global defaults, lock challenge-level skills at creation, or change a run's skills mid-solve (symlinks refresh and the agent resumes).
-- **TLS verification on by default**, with an explicit opt-out for self-signed/local events.
+**CTF Agent Orchestrator** giải quyết vấn đề này bằng cách:
+* **Môi trường cục bộ thực tế (Bare-metal Execution):** Mọi lệnh của agent đều chạy trực tiếp trên hệ thống Ubuntu với đầy đủ bộ công cụ: `gdb` (kèm `gef`/`pwndbg`), `pwntools`, `angr`, `z3`, `volatility3`, `tshark`, `binwalk`, `hashcat`, `john`, `apktool`, `bulk_extractor`, v.v.
+* **Tích hợp 9router Local:** Định tuyến tập trung toàn bộ request mô hình qua 9router local (`http://127.0.0.1:20128/v1`), hỗ trợ chọn linh hoạt giữa hàng chục model (GPT-6, DeepSeek-V4, Claude 3.7/Sonnet, Gemini...) và kiểm soát mức độ suy nghĩ (`effort`).
+* **Hỗ trợ Agent Đa Nền tảng:** Sử dụng bản native chính thức của **Claude Code** (qua `claude-agent-sdk`) và **Codex** (qua `codex app-server` JSON-RPC).
 
-**Infrastructure**
-- **One-command deploy** via Terraform to **Hetzner Cloud, DigitalOcean, or GCP**.
-- **Swarm** — dispatch a challenge to a dedicated, disposable GCP worker VM cloned from a golden image, isolating heavy CPU/RAM/disk work from the controller. See [SWARM.md](SWARM.md).
-- **WireGuard VPN** — built-in management for challenges that need network access to CTF infrastructure, with reverse routing to client-side internal CIDRs.
-- **Integrated tooling** — a persistent GDB MCP server (Claude + Codex) and headless IDA Pro analysis via the `analyze-with-ida-domain-api` skill (bring your own licensed IDA).
-- **Discord bot** (optional) — per-challenge threads/channels, real-time notifications, flag review, and slash commands for team coordination.
+---
 
-> For internals — collaboration model, filesystem layout, solve lifecycle, security model, persistence, and settings reference — see **[DESIGN.md](DESIGN.md)**.
+## 2. Chi tiết các tính năng chính
 
-<details>
-<summary><b>Full feature list</b> (click to expand)</summary>
+### 2.1. Cổng định tuyến AI Model (9router Gateway)
+Hệ thống kết nối trực tiếp với 9router daemon cục bộ để cấp quyền truy cập mô hình cho tất cả các solver:
+* **Tự động khám phá (Auto-discovery):** Tự tìm kiếm API key và native launcher từ `~/Documents/Codex/runtime/9router-clients/` mà không bắt buộc cấu hình biến môi trường thủ công hay đăng nhập tài khoản qua trình duyệt.
+* **Danh mục động (>60+ Models):** Tự động fetch danh sách model trực tiếp từ 9router. Giữ nguyên định danh chính xác (vd: `cx/gpt-6.1-sol`, `cmc/deepseek/deepseek-v4-pro`, `ag/claude-sonnet-4-6`).
+* **Kiểm soát Reasoning Effort chuyên sâu:**
+  * **Selectable:** Cho phép chọn giữa 5 mức độ suy luận chuẩn: `low`, `medium`, `high`, `xhigh`, `max` (dành cho các model OpenAI Reasoning / DeepSeek).
+  * **Provider-managed / Fixed:** Đối với các model Anthropic qua proxy hoặc biến thể Gemini fixed alias, giao diện tự động khoá dropdown và ghi chú rõ lý do kỹ thuật thay vì giả lập mức độ không được hỗ trợ.
+* **Cách ly cấu hình:** Chỉ truyền cấu hình gateway qua biến môi trường của tiến trình con (`child env`), tuyệt đối không ghi đè cấu hình native toàn cục của máy (`~/.claude/settings.json` hay `~/.codex/config.toml`).
 
-**Agents & models**
-- Claude Code (via `claude-agent-sdk`) and Codex (via `codex app-server`, JSON-RPC over stdio)
-- Per-agent model selection — Claude: Opus 4.8/4.7/4.6/4.5, Sonnet 4.6/4.5, Haiku 4.5, Fable 5 (default Opus 4.6 1M); Codex: discovered from local cache/config
-- Per-agent reasoning effort — Claude low/medium/high/max; Codex discovered (default XHigh), compatibility-guarded so unsupported combos fall back instead of failing
-- Per-provider session resume (Claude session id, Codex thread id) and a persistent default-agent toggle
+---
 
-**Solving & collaboration**
-- Single and parallel solving modes; race multiple agents on one challenge, or add runs to an existing challenge (promotes single → parallel)
-- Isolated per-run workspace with a symlinked `challenge_files/` view of the original files
-- Working notes per agent, cross-symlinked so teammates can read them
-- `notify_teammates` tool for validated breakthroughs (Claude in-process MCP tool, Codex dynamic tool), injected into teammates' sessions
-- User broadcast to all running agents (web or Discord)
-- Steer a running agent mid-solve; stop one run or all runs; Resume, Retry, Mark Solved, Unsolve
-- Auto-stop sibling runs when one solves or submits a correct flag
+### 2.2. Khởi tạo phiên 2 lượt (Two-Turn Persona Initiation)
+Nhằm đảm bảo agent tuân thủ chặt chẽ phong cách giải đề và nguyên tắc an toàn, hệ thống hỗ trợ cơ chế nạp chỉ dẫn khởi tạo:
+* **Tự động đọc `instruction.txt`:** Hệ thống quét file `instruction.txt` ở thư mục gốc ứng dụng khi bắt đầu một phiên làm việc mới.
+* **Lượt 1 (Prompt Khởi tạo):** Agent nhận chỉ dẫn từ `instruction.txt` trước tiên để thiết lập persona, nguyên tắc phân tích và phong cách làm việc. Agent gửi phản hồi xác nhận khởi tạo.
+* **Lượt 2 (Lệnh giải bài CTF):** Ngay sau khi Lượt 1 hoàn tất, hệ thống tự động giữ nguyên phiên (`session_id`/`thread_id`) và đưa tiếp prompt đề bài cùng đường dẫn thư mục bài tập để agent bắt đầu hành động.
+* **Bảo toàn ngữ cảnh:** Khi người dùng sử dụng tính năng **Steer** (nhắc bài) hoặc **Resume**, agent tiếp tục trò chuyện trong ngữ cảnh đã có mà không cần lặp lại lượt khởi tạo.
 
-**Web UI**
-- Real-time WebSocket streaming of thinking, tool calls, tool results, text, and raw output
-- Syntax highlighting, collapsible tool sections, copy buttons, subagent tabs, split or tabbed multi-agent layout, per-event elapsed timestamps, user prompts as chat bubbles
-- Flag detection for `flag{}`/`CTF{}`/`HTB{}`/`picoCTF{}`/custom formats with neutral → correct/rejected states that persist
-- Silent `ctfgrep` preflight that surfaces flag candidates before the agent starts; auto-submit detected flags to the connected platform
-- File browser for original files and per-run workspaces (image/text/hex), auto-refreshing, with safe server-side path resolution
-- Per-challenge statistics (input/output/cache tokens, cost, duration, API time, turns, tool calls, per-model breakdown, aggregate)
-- Usage dashboards (Claude auth/plan/org + token usage + daily chart; Codex auth status; per-agent challenge totals)
-- Per-challenge Advisor agent (configurable provider/model) that reads solver transcripts, answers questions, researches online, and relays hints
-- Markdown export reports + bulk export index; global cross-challenge toast notifications; keyboard shortcuts; responsive collapsible sidebar; dark/light theme
+---
 
-**Challenges & platforms**
-- Create single challenges or bulk-upload `.zip`/`.7z` archives (preview/edit metadata before import)
-- Import from CTFd, rCTF, Hack The Box CTF, CDDC, Cywaria/Cympire, SAS CTF, and GPN (auto-discovered plugin registry)
-- Saved platform connections with re-sync for new challenges and points/solves updates
-- On-demand Docker/machine instances started at solve time (HTB, Cywaria, SAS); connection info injected into the prompt
-- HTB multi-answer (`flagsInfo`) support with a `submit_answer.py` helper
-- Per-challenge import size cap; TLS verification on by default with an explicit insecure-TLS opt-out
+### 2.3. Quản lý thử thách & Phiên giải (Challenge Lifecycle)
+* **Tạo bài tập linh hoạt:**
+  * **Single Challenge:** Nhập thủ công tên, mô tả, định dạng cờ (`flag_format`), thể loại và tải lên file đính kèm.
+  * **Bulk Upload:** Tải lên file nén `.zip` hoặc `.7z` chứa nhiều bài tập, cho phép xem trước và tinh chỉnh trước khi nạp vào hệ thống.
+  * **Platform Import:** Đồng bộ bài thi tự động từ các nền tảng: **CTFd, rCTF, Hack The Box (HTB), CDDC, Cywaria/Cympire, SAS CTF, GPN**. Hỗ trợ lưu thông tin kết nối và tự động re-sync điểm số/số lượt giải.
+* **On-Demand Remote Instances:** Tự động gửi tín hiệu bật container Docker/máy ảo từ xa (đối với các bài HTB, Cywaria, SAS) ngay trước khi giải và tự động chèn IP/port kết nối vào prompt cho agent.
+* **Chế độ Chọn & Xóa hàng loạt:**
+  * Nút **Select** trên Header cho phép chuyển sang chế độ chọn nhiều bài tập.
+  * Nút **Delete Selected** xoá an toàn các bài tập đã chọn cùng toàn bộ workspace và tiến trình đang chạy.
+  * Nút **Download Zip** tải về toàn bộ tệp và nhật ký của các bài đã chọn.
+  * Nút **Clear All** cho phép dọn sạch toàn bộ các bài tập và phiên giải trên hệ thống với hộp thoại xác nhận bảo vệ.
 
-**Skills**
-- Repo skills (forensics and tool-specific) plus external [ljagiello/ctf-skills](https://github.com/ljagiello/ctf-skills), compiled into the `all-skills/` catalog
-- Selected skills symlinked into each run's `.claude/skills` and `.codex/skills`; Codex also receives them as structured skill inputs
-- Global default skills, challenge-level skills locked at creation, per-run skill overrides applied mid-run (stop → refresh symlinks → resume)
-- Upload new skills from Settings as a `.zip` bundle or a single `SKILL.md`
+---
 
-**Infrastructure & tooling**
-- One-command Terraform deploy to Hetzner Cloud, DigitalOcean, or GCP
-- Runtime-allowlist deploy sync that preserves `challenges/` and `state/` on the VM
-- Swarm: dispatch a challenge to a disposable GCP worker cloned from a golden image — per-challenge pinning, start/stop/delete, idle auto-stop (default 30 min), credential sync, a Local | Swarm (auto) | Swarm:\<instance\> run-target selector, live SSH file browse, and hub-and-spoke VPN routing
-- WireGuard VPN management: server control, generated Linux client config, reverse routing to client-side internal CIDRs, optional `dnsmasq` DNS forwarding, status (handshake age + transfer)
-- Persistent GDB MCP server (registered for Claude and Codex); headless IDA Pro analysis via the `analyze-with-ida-domain-api` skill (bring your own licensed IDA)
-- Rich preinstalled toolchain (reverse engineering, disk/memory/network/file forensics, crypto, pwn, web)
-- uv-based Python installs; dependency-aware parallel provisioning (`INSTALL_SCRIPTS_PARALLEL`); end-of-setup validation
+### 2.4. Chế độ giải bài & Phối hợp đồng đội (Single & Parallel Racing)
+* **Chế độ đơn lẻ (Single Mode):** Một agent tập trung phân tích bài tập từ đầu đến cuối.
+* **Chế độ chạy đua song song (Parallel Mode):**
+  * Gán nhiều agent cùng lúc (ví dụ: Claude Code chạy model Claude kết hợp Codex chạy model GPT-6).
+  * Mỗi agent sở hữu một workspace độc lập trong thư mục `_runs/<run_id>/` để tránh ghi đè file của nhau.
+  * **Working Notes & Phối hợp đồng đội:** Tự động liên kết mềm (`symlink`) file `WORKING_NOTES.md` giữa các agent. Agent có thể sử dụng tool `notify_teammates` để thông báo khi tìm thấy manh mối đột phá.
+  * **Auto-stop Siblings:** Ngay khi một agent tìm thấy và nộp cờ chính xác, toàn bộ các agent khác đang giải cùng bài sẽ tự động dừng lại để tiết kiệm chi phí/tài nguyên.
+* **Can thiệp thời gian thực (Interactive Controls):**
+  * **Steer:** Gửi chỉ dẫn bổ sung, gợi ý hoặc sửa sai cho agent ngay giữa phiên giải.
+  * **Stop:** Dừng ngay tiến trình agent đang chạy.
+  * **Resume / Retry:** Tiếp tục phiên đã dừng hoặc bắt đầu lại từ đầu với một session mới tinh.
+  * **Mark Solved / Unsolve:** Đánh dấu trạng thái bài tập thủ công khi cần.
 
-**Discord (optional)**
-- Per-challenge destination as a thread or a category-matched channel
-- Notifications for starts, stops, solves, flag detections, breakthroughs, and completions
-- Flag-review buttons (submit / reject / mark correct / broadcast) and challenge action buttons (status, stats, tail, flags, submit, solved, stop, resume)
-- Slash commands: `/broadcast` `/ctf` `/files` `/flags` `/help` `/resume` `/solved` `/stats` `/status` `/steer` `/stop` `/submit` `/tail`
-- Live settings reconcile (gateway starts/stops/restarts on config change)
+---
 
-**Persistence & security**
-- Challenge metadata, run history, detected flags, per-run JSONL logs, platform connections, and settings persisted under `state/` and `challenges/`; stale `solving` runs reset on restart
-- HTTP Basic/session auth, CSRF on state-changing routes, authenticated WebSockets with Origin validation
-- Browser hardening headers (CSP, `nosniff`, Referrer-Policy, X-Frame-Options, Permissions-Policy, COOP, HSTS over TLS)
+### 2.5. Hệ thống Kỹ năng (CTF Skills) & Debugger MCP
+Hệ thống sử dụng các tài liệu phương pháp luận (`SKILL.md`) để định hướng quy trình giải bài cho agent:
+* **Kho kỹ năng chuyên sâu:**
+  * **Forensics:** Phân tích bộ nhớ Linux/Windows (`volatility3`), phân tích packet (`tshark`), trích xuất dữ liệu ẩn (`stego`, `binwalk`, `bulk_extractor`).
+  * **Pwn / Binary Exploitation:** Kỹ thuật khai thác stack, heap, tạo chuỗi ROP tự động (`angrop`), kernel exploitation, bảo vệ canary/ASLR.
+  * **Reverse Engineering:** Tự động hoá với `angr`, decompile với Ghidra / IDA Pro headless API, phân tích ứng dụng Android (`apktool`).
+  * **Web & Crypto:** Tấn công JWT, padding oracle, RSA, elliptic curve, tấn công lattice/LLL với Sagemath.
+* **Cơ chế nạp kỹ năng:**
+  * **Chế độ Auto:** Tự động nhận diện category bài tập và các định dạng file (`.pcap`, `.elf`, `.apk`, `.mem`) để symlink đúng các skill cần thiết vào thư mục `.claude/skills` hoặc `.codex/skills`.
+  * **Chế độ Manual:** Cho phép người dùng tick chọn chính xác từng skill cho bài tập.
+* **Persistent GDB MCP Server:** Cung cấp sẵn server FastMCP kết nối trực tiếp với GDB trên máy, cho phép agent đặt breakpoint, đọc thanh ghi, kiểm tra bộ nhớ trực tiếp trong session Claude/Codex.
 
-</details>
+---
 
-## Supported Agents
+### 2.6. Giao diện Web thời gian thực (Real-time Web UI)
+Giao diện đơn trang hiện đại, phục vụ trực tiếp qua cổng `http://127.0.0.1:8000`:
+* **WebSocket Live Stream:** Truyền tải luồng phản hồi tức thì gồm: khối suy nghĩ (`thinking`), các lệnh bash đang chạy, output terminal, và tin nhắn trò chuyện.
+* **Trình duyệt File tích hợp (File Viewer):** Xem trực tiếp file đề bài và sản phẩm trong workspace của agent: hiển thị ảnh, làm nổi bật cú pháp file mã nguồn, và chế độ xem Hex (`Hex Viewer`) cho các file binary.
+* **Bắt cờ tự động (Flag Detection):**
+  * Tự động quét regex cho các định dạng: `flag{...}`, `CTF{...}`, `HTB{...}`, `picoCTF{...}` hoặc định dạng tuỳ chỉnh.
+  * **Silent `ctfgrep` Preflight:** Tự động quét chuỗi nhị phân trong file đề bài trước khi agent bắt đầu; nếu cờ nằm sẵn trong file plain text/strings, hệ thống sẽ phát hiện ngay lập tức.
+  * **Auto-submit:** Tự động gửi cờ lên nền tảng CTF đã kết nối và cập nhật điểm số.
+* **Bảng điều khiển Usage & Thống kê:** Hiển thị chi tiết số lượng token đầu vào/đầu ra, thời gian xử lý, số lượt tool call và trạng thái kết nối của từng harness.
 
-| Agent | Models | Effort levels | Resume | Collaboration | Steering |
-|-------|--------|---------------|--------|---------------|----------|
-| **Claude Code** | Provider default, Fable 5, Opus 4.8/4.7/4.6/4.5, Sonnet 4.6/4.5, Haiku 4.5 (default **Opus 4.6 1M**) | Provider default, Low, Medium, High, Max (default **High**) | ✅ | `notify_teammates`, working notes | ✅ |
-| **Codex** | Discovered from local Codex cache/config | Per-model; common fallback Low, Medium, High, XHigh (default **XHigh**) | ✅ | `notify_teammates`, working notes | ✅ |
+---
 
-Two or more agent rows on a challenge automatically create a parallel run.
+### 2.7. Trợ lý cố vấn chiến thuật (Advisor AI)
+* **Advisor Panel:** Mỗi bài tập có một khung trò chuyện với cố vấn riêng biệt.
+* Cố vấn có quyền đọc toàn bộ log hoạt động và transcript hiện tại của các solver đang chạy, giải đáp thắc mắc của bạn về bài thi, tra cứu CVE/kỹ thuật liên quan trên Internet, và có thể gửi các gợi ý súc tích trực tiếp vào phiên giải của solver.
 
-## Getting Started
+---
 
-### 1. Deploy the VM
+### 2.8. Tích hợp Discord Bot (Tuỳ chọn)
+* Cấu hình Discord Bot Token trong mục **Settings**.
+* Tự động tạo channel hoặc thread riêng cho từng challenge.
+* Thông báo tức thì khi agent bắt đầu, tìm thấy cờ, giải thành công hoặc dừng lại.
+* Hỗ trợ Slash Commands để điều khiển từ xa: `/ctf`, `/status`, `/flags`, `/submit`, `/steer`, `/resume`, `/stop`.
 
-Pick a cloud provider (see [infra/README.md](infra/README.md) for provider-specific options):
+---
 
+## 3. Tài nguyên hệ thống & Mức độ chiếm dụng
+
+Hệ thống được tối ưu hóa để chạy mượt mà ngay trên các máy có cấu hình tiêu chuẩn (8 Core CPU, 8 GB RAM):
+
+| Thành phần | Mức RAM chiếm dụng | Mức CPU | Đặc điểm hoạt động |
+| :--- | :--- | :--- | :--- |
+| **Webapp Backend (`ctf-solver`)** | ~110 MB | < 1% | Server Uvicorn/Starlette xử lý API & WebSocket |
+| **9router Daemon** | ~20 - 30 MB | ~0% | Proxy HTTP định tuyến request sang mô hình |
+| **Tiến trình Claude Code (Mỗi run)** | ~90 - 200 MB | < 5% | Phần lớn thời gian đợi stream mạng từ 9router |
+| **Tiến trình Codex (Mỗi run)** | ~120 - 250 MB | < 5% | Chạy chế độ `app-server` JSON-RPC qua stdio |
+| **Công cụ CTF thường (gdb, pwntools, tshark)** | ~50 - 250 MB | Thấp | Chạy theo từng tool call cụ thể |
+| **Công cụ CTF nặng (`angr`, `volatility3`, `z3`)** | 1.0 - 2.5 GB | 100% (1-2 core) | Chỉ tăng cao khi agent chạy symbolic execution hoặc quét dump bộ nhớ lớn |
+
+*Khuyến nghị:* Nên chạy 1 đến 2 agent song song trên máy cục bộ để đảm bảo an toàn bộ nhớ.
+
+---
+
+## 4. Cài đặt & Khởi chạy nhanh
+
+### Yêu cầu hệ thống
+* Hệ điều hành: **Ubuntu 24.04 LTS x86_64** (hoặc Debian 12+)
+* Python: **3.12+**
+* Node.js: **v20+**
+* Daemon **9router** đang chạy trên máy (mặc định tại `http://127.0.0.1:20128/v1`).
+
+### Khởi động dịch vụ
+Ứng dụng đã được cấu hình systemd user service trên máy:
 ```bash
-cd infra/hetzner          # or infra/digitalocean or infra/gcp
-cp terraform.tfvars.example terraform.tfvars
-# edit terraform.tfvars with your settings
+# Khởi động hoặc khởi động lại dịch vụ
+systemctl --user restart ctf-solver.service
 
-terraform init
-terraform apply
+# Kiểm tra trạng thái hoạt động
+systemctl --user status ctf-solver.service
 ```
 
-This creates the VM, copies runtime files, runs the setup scripts, validates the environment, and starts the webapp service. Retrieve the login password with:
-
+Hoặc khởi chạy trực tiếp qua script:
 ```bash
-terraform output -raw webapp_password   # also stored on the VM at /root/.ctf-solver-password
+cd webapp
+./start.sh
 ```
 
-### 2. Authenticate the agents
+Truy cập giao diện Web tại: **`http://127.0.0.1:8000`**
 
-SSH in and log in to whichever agents you'll use:
+### Quy trình giải bài mẫu
+1. Mở trình duyệt tại `http://127.0.0.1:8000`.
+2. Bấm **+ Add Challenge** -> Chọn **Add Single Challenge**.
+3. Điền tên bài, mô tả, tải lên file đính kèm.
+4. Chọn Harness (**Claude** hoặc **Codex**), chọn Model từ danh sách 9router (vd: `cmc/deepseek/deepseek-v4-pro` hoặc `cx/gpt-6.1-sol`) và mức Effort mong muốn.
+5. Bấm **Create & Solve**:
+   * Hệ thống tự động gửi prompt từ `instruction.txt` khởi tạo agent (Lượt 1).
+   * Agent phản hồi và nhận tiếp đề bài CTF (Lượt 2).
+   * Bạn theo dõi trực tiếp quá trình agent gõ lệnh, phân tích mã nguồn và giải mã cờ theo thời gian thực.
+6. Khi tìm thấy cờ, hệ thống tự động bôi đậm cờ và đánh dấu bài tập là **Solved**.
 
-```bash
-ssh root@$(terraform output -raw external_ip)
-claude auth login      # Claude Code
-codex login            # Codex
-```
+---
 
-### 3. Solve from the web UI
-
-Open `https://<VM_IP>` and log in, then:
-
-1. **+ Add Challenge** → Single, Bulk Upload, or Import from Platform.
-2. Fill in name, description, flag format, and upload/import files.
-3. Pick agent / model / effort — add more rows to race in parallel.
-4. **Create & Solve** and watch output stream live.
-5. Steer if it stalls; Resume/Retry if it finishes unsolved; use the Files tab to inspect workspaces.
-
-### 4. (Optional) Discord
-
-Enable Discord in **Settings** with a bot token and channel. The bot creates per-challenge threads/channels and supports slash commands — `/ctf`, `/status`, `/flags`, `/files`, `/broadcast`, `/submit`, `/solved`, `/resume`, `/stop`.
-
-### Teardown
-
-```bash
-cd infra/hetzner   # or your provider
-terraform destroy
-```
-
-## Skills
-
-Skills are structured workflows that steer how agents approach challenge types. They come from two sources, both compiled into the runtime `all-skills/` catalog during setup:
-
-- **This repo** (`skills/`) — forensics (disk, memory, pcap, stego/repair) and tool-specific skills (IDA, apk analysis, kernel GEF debugging, angrop ROP chains).
-- **[ljagiello/ctf-skills](https://github.com/ljagiello/ctf-skills)** — category skills for pwn, web, crypto, rev, misc, osint, malware, and AI/ML.
-
-The webapp symlinks selected skills into each run's `.claude/skills` and `.codex/skills`. You can also upload a `.zip` bundle or single `SKILL.md` from **Settings**. See [skills/README.md](skills/README.md) for the full catalog.
-
-## Project Structure
+## 5. Cấu trúc thư mục dự án
 
 ```text
-infra/            Terraform configs (Hetzner, DigitalOcean, GCP)
-install_scripts/  Numbered provisioning scripts (tools, CLIs, deps); run.sh, lib/ helpers
-webapp/           Starlette/ASGI app — challenge management + agent streaming
-  agents/         Agent provider implementations (Claude, Codex) + broadcast bus
-  plugins/        CTF platform integrations (CTFd, rCTF, HTB, CDDC, Cywaria, SAS)
-  swarm*.py       Remote GCP worker dispatch (manager, runner, exec)
-  static/         Frontend (vanilla JS, CSS)
-mcps/             MCP servers (GDB debugger)
-skills/           Repo-owned agent skills (forensics, tools)
+ctf-agent-workstation/
+├── webapp/                 # Backend Starlette ASGI & bộ điều phối trung tâm
+│   ├── app.py              # Xử lý route, streaming, lifecycle và quản lý file
+│   ├── model_gateway.py    # Tích hợp 9router local, catalog động & effort policy
+│   ├── agents/             # Adapter cho Claude Code (SDK) và Codex (app-server)
+│   ├── plugins/            # Plugin tích hợp các nền tảng CTF (CTFd, HTB, SAS...)
+│   └── static/             # Frontend HTML/CSS/JavaScript thuần (không cần build)
+├── skills/                 # Thư viện CTF Skills (Forensics, Pwn, Reversing, Crypto)
+├── mcps/                   # MCP server (FastMCP GDB debugger)
+├── install_scripts/        # Bộ script cài đặt công cụ an ninh mạng tự động
+├── infra/                  # Terraform template triển khai lên Hetzner / DO / GCP
+├── instruction.txt         # File prompt khởi tạo persona & quy tắc ban đầu cho agent
+└── README.md               # Tài liệu hướng dẫn sử dụng chi tiết
 ```
-
-Runtime-only directories created on the VM: `all-skills/` (compiled skill catalog), `challenges/` (uploaded files, workspaces, settings), and `state/` (challenge metadata, per-run JSONL logs, platform connections). These are preserved across deploy syncs.
-
-## Documentation
-
-- **[DESIGN.md](DESIGN.md)** — architecture, collaboration model, filesystem layout, solve lifecycle, platform plugins, VPN, security, persistence, and the full settings reference.
-- **[SWARM.md](SWARM.md)** — remote GCP execution design and operations.
-- **[infra/README.md](infra/README.md)** — per-provider Terraform usage.
-- **[skills/README.md](skills/README.md)** — skill catalog.
-</content>
-</invoke>

@@ -158,14 +158,12 @@ resource "null_resource" "provision" {
       step "Installing and starting ctf-solver.service"
       ssh $SSH_OPTS root@"$IP" "cp /root/ctf-agent-wrapper/webapp/ctf-solver.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable ctf-solver && systemctl restart ctf-solver"
 
-      step "Waiting for generated web app password"
-      ssh $SSH_OPTS root@"$IP" "timeout 300 bash -c 'until [ -f /root/.ctf-solver-password ]; do sleep 1; done'"
 
       echo ""
       echo "============================================"
       echo "  CTF Solver Web App"
-      echo "  URL:      https://$IP"
-      echo "  Password: $(ssh $SSH_OPTS root@"$IP" cat /root/.ctf-solver-password)"
+      echo "  URL: http://127.0.0.1:8000 (no login)"
+      echo "  Access: ssh -N -L 8000:127.0.0.1:8000 -i $SSH_KEY_PATH root@$IP"
       echo "============================================"
       echo ""
     EOT

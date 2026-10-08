@@ -4,10 +4,6 @@ terraform {
       source  = "hetznercloud/hcloud"
       version = "~> 1.60"
     }
-    local = {
-      source  = "hashicorp/local"
-      version = "~> 2.5"
-    }
     null = {
       source  = "hashicorp/null"
       version = "~> 3.0"
@@ -191,7 +187,6 @@ resource "null_resource" "deploy_webapp" {
       set -euo pipefail
 
       IP="${hcloud_server.ctf.ipv4_address}"
-      WEBAPP_PASSWORD_FILE="${path.module}/.webapp-password"
       SSH_KEY_PATH="${pathexpand(var.ssh_private_key_path)}"
       SSH_OPTS="-i $SSH_KEY_PATH -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5"
       step() { echo "==> $1"; }
@@ -204,29 +199,15 @@ resource "null_resource" "deploy_webapp" {
       step "Installing and starting ctf-solver.service"
       ssh $SSH_OPTS root@"$IP" "cp /root/ctf-agent-wrapper/webapp/ctf-solver.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable ctf-solver && systemctl restart ctf-solver"
 
-      step "Waiting for generated web app password"
-      ssh $SSH_OPTS root@"$IP" "timeout 300 bash -c 'until [ -f /root/.ctf-solver-password ]; do sleep 1; done'"
-
-      step "Saving web app password locally"
-      umask 077
-      ssh $SSH_OPTS root@"$IP" cat /root/.ctf-solver-password > "$WEBAPP_PASSWORD_FILE"
       echo ""
       echo "============================================"
       echo "  CTF Solver Web App"
-      echo "  URL:      https://$IP"
-      echo "  Password: $(cat "$WEBAPP_PASSWORD_FILE")"
-      echo ""
-      echo "  Next Steps:"
-      echo "  Run: ssh root@$IP -i $SSH_KEY_PATH"
-      echo "  Run: claude auth login"
-      echo "  Run: codex login"
+      echo "  URL: http://127.0.0.1:8000 (no login)"
+      echo "  Access: ssh -N -L 8000:127.0.0.1:8000 -i $SSH_KEY_PATH root@$IP"
+      echo "  Configure local 9router on the VM before solving."
       echo "============================================"
       echo ""
     EOT
   }
 }
 
-data "local_file" "webapp_password" {
-  filename   = "${path.module}/.webapp-password"
-  depends_on = [null_resource.deploy_webapp]
-}

@@ -84,7 +84,7 @@ check_py_import httpx
 check_py_import requests
 check_py_import websockets
 check_py_import claude_agent_sdk
-check_py_import mcp.server.fastmcp
+check_py_import mcp.server.mcpserver
 check_py_import idapro
 check_py_import ida_domain
 check_py_import pwn

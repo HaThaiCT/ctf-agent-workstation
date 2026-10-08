@@ -7,10 +7,6 @@ output "external_ip" {
 }
 
 output "webapp_url" {
-  value = "https://${hcloud_server.ctf.ipv4_address}"
-}
-
-output "webapp_password" {
-  value     = data.local_file.webapp_password.content
-  sensitive = true
+  value       = "http://127.0.0.1:8000"
+  description = "Open locally after forwarding SSH port 8000 to the VM."
 }

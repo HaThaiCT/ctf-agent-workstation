@@ -5,28 +5,57 @@ import base64
 import json
 import logging
 import os
-import tomllib
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from .base import AgentProvider
+import tomllib
+
+try:
+    from ..runtime_resources import workspace_mcp_servers
+except ImportError:
+    from runtime_resources import workspace_mcp_servers
+
+from .base import AgentProvider, GatewayRuntime
 
 log = logging.getLogger("ctf-solver.codex")
 
-CODEX_AUTH_FILE = Path.home() / ".codex" / "auth.json"
-CODEX_CONFIG_FILE = Path.home() / ".codex" / "config.toml"
-CODEX_MODELS_CACHE_FILE = Path.home() / ".codex" / "models_cache.json"
-CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
-CODEX_USAGE_API = "https://chatgpt.com/backend-api/wham/usage"
-REASONING_LEVEL_ORDER = ("minimal", "low", "medium", "high", "xhigh")
-REASONING_LABELS = {
-    "minimal": "Minimal",
-    "low": "Low",
-    "medium": "Medium",
-    "high": "High",
-    "xhigh": "XHigh",
-}
-DEFAULT_COMMON_REASONING_LEVELS = {"low", "medium", "high", "xhigh"}
+
+def codex_gateway_launch(
+    runtime: GatewayRuntime, tail: list[str], *, cwd: str | Path = ".",
+) -> tuple[list[str], dict[str, str]]:
+    """Build a native Codex launch without syncing global client configuration."""
+    overrides = {
+        "model_provider": "ctf_9router",
+        "model_providers.ctf_9router.name": "9Router",
+        "model_providers.ctf_9router.base_url": runtime.config.base_url,
+        "model_providers.ctf_9router.env_key": "CTF_GATEWAY_API_KEY",
+        "model_providers.ctf_9router.wire_api": "responses",
+        "model_providers.ctf_9router.requires_openai_auth": False,
+        "model_providers.ctf_9router.supports_websockets": False,
+        "model_catalog_json": runtime.codex_catalog_path,
+    }
+    existing = {}
+    try:
+        native_config = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "config.toml"
+        existing = tomllib.loads(native_config.read_text()).get("mcp_servers", {})
+    except (OSError, ValueError):
+        pass
+    for name, server in workspace_mcp_servers(cwd).items():
+        if name in existing:
+            continue
+        prefix = "mcp_servers." + name
+        for key in ("command", "args"):
+            if key in server:
+                overrides[prefix + "." + key] = server[key]
+    cmd = list(runtime.config.codex_command)
+    for key, value in overrides.items():
+        cmd.extend(["-c", key + "=" + json.dumps(value)])
+    cmd.extend(tail)
+    env = os.environ.copy()
+    env["CTF_GATEWAY_API_KEY"] = runtime.config.api_key
+    return cmd, env
+
+CODEX_SESSIONS_DIR = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
 
 
 def _read_skill_name(skill_file: Path, fallback: str) -> str:
@@ -167,83 +196,6 @@ def _text_elements_for_skill_mentions(
     return elements
 
 
-def _model_reasoning_map() -> dict[str, set[str]]:
-    if not CODEX_MODELS_CACHE_FILE.exists():
-        return {}
-    try:
-        cache = json.loads(CODEX_MODELS_CACHE_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-    mapping: dict[str, set[str]] = {}
-    for entry in cache.get("models", []):
-        if not isinstance(entry, dict):
-            continue
-        slug = entry.get("slug")
-        if not isinstance(slug, str) or not slug:
-            continue
-        levels: set[str] = set()
-        for raw in entry.get("supported_reasoning_levels", []) or []:
-            effort = ""
-            if isinstance(raw, dict):
-                value = raw.get("effort")
-                if isinstance(value, str):
-                    effort = value
-            elif isinstance(raw, str):
-                effort = raw
-            effort = effort.strip().lower()
-            if effort in REASONING_LEVEL_ORDER:
-                levels.add(effort)
-        if levels:
-            mapping[slug] = levels
-    return mapping
-
-
-def _common_supported_efforts(
-    mapping: dict[str, set[str]] | None = None,
-) -> set[str]:
-    if mapping is None:
-        mapping = _model_reasoning_map()
-    if not mapping:
-        return set(DEFAULT_COMMON_REASONING_LEVELS)
-    values = list(mapping.values())
-    common = set(values[0])
-    for levels in values[1:]:
-        common &= levels
-    return common or set(DEFAULT_COMMON_REASONING_LEVELS)
-
-
-def _resolve_effort(model: str, effort: str) -> str:
-    effort = (effort or "").strip().lower()
-    if effort not in REASONING_LEVEL_ORDER:
-        return ""
-    mapping = _model_reasoning_map()
-    common = _common_supported_efforts(mapping)
-
-    model = (model or "").strip()
-    if model:
-        supported = mapping.get(model)
-        if supported:
-            return effort if effort in supported else ""
-        return effort if effort in common else ""
-
-    return effort if effort in common else ""
-
-
-def _discover_effort_levels() -> tuple[tuple[str, str], ...]:
-    allowed = set()
-    for levels in _model_reasoning_map().values():
-        allowed |= levels
-    if not allowed:
-        allowed = set(DEFAULT_COMMON_REASONING_LEVELS)
-
-    options: list[tuple[str, str]] = [("", "Provider default")]
-    for level in REASONING_LEVEL_ORDER:
-        if level in allowed:
-            options.append((level, REASONING_LABELS[level]))
-    return tuple(options)
-
-
 def _item_text(item: dict) -> str:
     text = item.get("text")
     if isinstance(text, str) and text:
@@ -333,7 +285,7 @@ def _build_command(
     challenge: dict, prompt: str, is_continue: bool
 ) -> list[str]:
     model = challenge.get("model", "")
-    effort = _resolve_effort(model, challenge.get("effort", ""))
+    effort = challenge.get("effort", "")
 
     if is_continue:
         cmd = [
@@ -353,7 +305,7 @@ def _build_command(
         if model:
             cmd.extend(["--model", model])
         if effort:
-            cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
+            cmd.extend(["-c", "model_reasoning_effort=" + json.dumps(effort)])
         cmd.append(prompt)
         return cmd
 
@@ -369,62 +321,9 @@ def _build_command(
     if model:
         cmd.extend(["--model", model])
     if effort:
-        cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
+        cmd.extend(["-c", "model_reasoning_effort=" + json.dumps(effort)])
     cmd.append(prompt)
     return cmd
-
-
-def _configured_model() -> str:
-    if not CODEX_CONFIG_FILE.exists():
-        return ""
-    try:
-        config = tomllib.loads(CODEX_CONFIG_FILE.read_text())
-    except (OSError, tomllib.TOMLDecodeError):
-        return ""
-    value = config.get("model")
-    return value if isinstance(value, str) else ""
-
-
-def _discover_models() -> tuple[tuple[str, str], ...]:
-    models: list[tuple[str, str]] = [("", "Provider default")]
-    seen = {""}
-
-    configured = _configured_model()
-    if configured:
-        seen.add(configured)
-        models.append((configured, configured))
-
-    if CODEX_MODELS_CACHE_FILE.exists():
-        try:
-            cache = json.loads(CODEX_MODELS_CACHE_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
-            cache = {}
-
-        for entry in cache.get("models", []):
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("visibility") not in {None, "list"}:
-                continue
-            slug = entry.get("slug")
-            if isinstance(slug, str) and slug and slug not in seen:
-                seen.add(slug)
-                label = entry.get("display_name")
-                models.append((
-                    slug,
-                    label if isinstance(label, str) and label else slug,
-                ))
-
-    if len(models) <= 1:
-        for slug in (
-            "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
-            "gpt-5.3-codex", "gpt-5.3-codex-spark",
-            "gpt-5.2",
-        ):
-            if slug not in seen:
-                seen.add(slug)
-                models.append((slug, slug))
-
-    return tuple(models)
 
 
 def _normalize_saved_events(events: list[dict]) -> list[dict]:
@@ -882,170 +781,6 @@ def _normalize_live_event(event: dict, challenge: dict) -> dict | None:
     return event
 
 
-def _detect_auth_method(value: object) -> str | None:
-    if isinstance(value, dict):
-        keys = {str(k).lower() for k in value}
-        if {"access_token", "refresh_token"} & keys:
-            return "ChatGPT"
-        if {"api_key", "openai_api_key"} & keys:
-            return "API key"
-        for nested in value.values():
-            detected = _detect_auth_method(nested)
-            if detected:
-                return detected
-    elif isinstance(value, list):
-        for nested in value:
-            detected = _detect_auth_method(nested)
-            if detected:
-                return detected
-    return None
-
-
-def _get_session_count() -> int:
-    if not CODEX_SESSIONS_DIR.is_dir():
-        return 0
-    return sum(
-        1
-        for path in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl")
-        if path.is_file()
-    )
-
-
-def _get_codex_token() -> str | None:
-    if not CODEX_AUTH_FILE.exists():
-        return None
-    try:
-        auth = json.loads(CODEX_AUTH_FILE.read_text())
-        return auth.get("tokens", {}).get("access_token")
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def _fetch_codex_usage() -> dict | None:
-    import requests
-
-    token = _get_codex_token()
-    if not token:
-        return None
-    try:
-        resp = requests.get(
-            CODEX_USAGE_API,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception:
-        log.debug("Failed to fetch Codex usage API", exc_info=True)
-    return None
-
-
-def _format_reset_seconds(secs: int | None) -> str:
-    if not secs or secs <= 0:
-        return "now"
-    hours, remainder = divmod(secs, 3600)
-    minutes = remainder // 60
-    if hours > 24:
-        days = hours // 24
-        hours = hours % 24
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {minutes}m"
-    return f"{minutes}m"
-
-
-def _get_usage_data() -> dict | None:
-    if not CODEX_AUTH_FILE.exists():
-        return None
-
-    auth_method = "Configured"
-    try:
-        auth_file = json.loads(CODEX_AUTH_FILE.read_text())
-        auth_method = _detect_auth_method(auth_file) or auth_method
-    except (json.JSONDecodeError, OSError):
-        pass
-
-    data = {
-        "auth_rows": [
-            {"label": "Status", "value": "Configured"},
-            {"label": "Method", "value": auth_method},
-        ],
-        "stat_rows": [],
-        "daily_activity": [],
-        "daily_activity_title": None,
-    }
-
-    usage = _fetch_codex_usage()
-    if usage:
-        if usage.get("email"):
-            data["auth_rows"].insert(0, {
-                "label": "Account",
-                "value": usage["email"],
-            })
-        if usage.get("plan_type"):
-            data["auth_rows"].append({
-                "label": "Plan",
-                "value": usage["plan_type"].title(),
-            })
-
-        rl = usage.get("rate_limit") or {}
-        pw = rl.get("primary_window") or {}
-        sw = rl.get("secondary_window") or {}
-
-        if "used_percent" in pw:
-            reset = _format_reset_seconds(pw.get("reset_after_seconds"))
-            label = "5h usage"
-            if reset:
-                label += f" (resets in {reset})"
-            data["stat_rows"].append({
-                "label": label,
-                "value": f"{pw['used_percent']}%",
-                "bar": pw["used_percent"],
-            })
-        if "used_percent" in sw:
-            reset = _format_reset_seconds(sw.get("reset_after_seconds"))
-            label = "Weekly usage"
-            if reset:
-                label += f" (resets in {reset})"
-            data["stat_rows"].append({
-                "label": label,
-                "value": f"{sw['used_percent']}%",
-                "bar": sw["used_percent"],
-            })
-
-        for extra in usage.get("additional_rate_limits") or []:
-            name = extra.get("limit_name", "")
-            erl = extra.get("rate_limit") or {}
-            epw = erl.get("primary_window") or {}
-            esw = erl.get("secondary_window") or {}
-            if "used_percent" in epw and name:
-                reset = _format_reset_seconds(
-                    epw.get("reset_after_seconds")
-                )
-                label = f"{name} 5h"
-                if reset:
-                    label += f" (resets in {reset})"
-                data["stat_rows"].append({
-                    "label": label,
-                    "value": f"{epw['used_percent']}%",
-                    "bar": epw["used_percent"],
-                })
-
-        credits_info = usage.get("credits") or {}
-        if credits_info.get("has_credits"):
-            data["stat_rows"].append({
-                "label": "Credits",
-                "value": f"${credits_info.get('balance', '0')}",
-            })
-
-    data["stat_rows"].append({
-        "label": "Sessions",
-        "value": str(_get_session_count()),
-    })
-
-    return data
-
-
 # ---------------------------------------------------------------------------
 # SDK-based agent runner via codex app-server JSON-RPC over stdio
 # ---------------------------------------------------------------------------
@@ -1241,15 +976,18 @@ async def _codex_app_server_request(
     cwd: str | Path,
     *,
     resume_thread_id: str = "",
+    gateway: GatewayRuntime,
 ) -> dict:
     """Run a short-lived Codex app-server request for idle thread updates."""
     cwd_str = str(Path(cwd).resolve())
+    cmd, env = codex_gateway_launch(gateway, ["app-server", "--listen", "stdio://"], cwd=cwd_str)
     proc = await asyncio.create_subprocess_exec(
-        "codex", "app-server", "--listen", "stdio://",
+        *cmd,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd_str,
+        env=env,
         limit=2 ** 24,
     )
 
@@ -1330,6 +1068,8 @@ async def _codex_app_server_request(
                     "sandbox": "danger-full-access",
                     "cwd": cwd_str,
                     "runtimeWorkspaceRoots": [cwd_str],
+                    "model": gateway.model,
+                    **({"config": {"model_reasoning_effort": gateway.effort}} if gateway.effort else {}),
                 },
             )
             await _read_response(rid)
@@ -1361,6 +1101,8 @@ async def _set_thread_goal(
     thread_id: str,
     objective: str,
     cwd: str | Path = ".",
+    *,
+    gateway: GatewayRuntime,
 ) -> dict | None:
     result = await _codex_app_server_request(
         "thread/goal/set",
@@ -1371,16 +1113,20 @@ async def _set_thread_goal(
         },
         cwd,
         resume_thread_id=thread_id,
+        gateway=gateway,
     )
     return _normalize_goal(result.get("goal"))
 
 
-async def _clear_thread_goal(thread_id: str, cwd: str | Path = ".") -> bool:
+async def _clear_thread_goal(
+    thread_id: str, cwd: str | Path = ".", *, gateway: GatewayRuntime,
+) -> bool:
     result = await _codex_app_server_request(
         "thread/goal/clear",
         {"threadId": thread_id},
         cwd,
         resume_thread_id=thread_id,
+        gateway=gateway,
     )
     return bool(result.get("cleared", True))
 
@@ -1957,6 +1703,11 @@ async def _run_agent_sdk(
     **kwargs,
 ) -> AsyncIterator[dict]:
     """Run Codex via the app-server JSON-RPC protocol over stdio."""
+    gateway = kwargs.get("_gateway")
+    if not isinstance(gateway, GatewayRuntime):
+        yield {"type": "error", "message": "9router runtime configuration is missing"}
+        return
+    model, effort = gateway.model, gateway.effort
     if session_state is None:
         session_state = {}
     run_ref = kwargs.get("_run")
@@ -1977,7 +1728,7 @@ async def _run_agent_sdk(
     cwd_str = str(Path(cwd).resolve())
 
     # Build the command to spawn
-    cmd = ["codex", "app-server", "--listen", "stdio://"]
+    cmd, env = codex_gateway_launch(gateway, ["app-server", "--listen", "stdio://"], cwd=cwd_str)
 
     log.info("Spawning codex app-server: %s (cwd=%s)", cmd, cwd_str)
 
@@ -1987,6 +1738,7 @@ async def _run_agent_sdk(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd_str,
+        env=env,
         start_new_session=True,
         limit=2 ** 24,  # 16 MB — default 64 KB is too small for large JSON-RPC messages
     )
@@ -2183,11 +1935,7 @@ async def _run_agent_sdk(
             if model:
                 resume_params["model"] = model
             if effort:
-                resolved = _resolve_effort(model, effort)
-                if resolved:
-                    resume_params["config"] = {
-                        "model_reasoning_effort": resolved,
-                    }
+                resume_params["config"] = {"model_reasoning_effort": effort}
             try:
                 rid = await _send_request("thread/resume", resume_params)
                 resume_result = await _read_response(rid)
@@ -2254,11 +2002,7 @@ async def _run_agent_sdk(
             if model:
                 thread_params["model"] = model
             if effort:
-                resolved = _resolve_effort(model, effort)
-                if resolved:
-                    thread_params["config"] = {
-                        "model_reasoning_effort": resolved,
-                    }
+                thread_params["config"] = {"model_reasoning_effort": effort}
 
             rid = await _send_request("thread/start", thread_params)
             thread_result = await _read_response(rid)
@@ -2320,10 +2064,22 @@ async def _run_agent_sdk(
                 canonical_inputs = _skill_inputs_from_list_result(
                     skills_result
                 )
-                if canonical_inputs:
-                    skill_inputs = canonical_inputs
+                allowed_paths = {str(Path(item["path"]).resolve()) for item in skill_inputs}
+                canonical_by_path = {str(Path(item["path"]).resolve()): item for item in canonical_inputs
+                                     if str(Path(item["path"]).resolve()) in allowed_paths}
+                skill_inputs = [canonical_by_path.get(str(Path(item["path"]).resolve()), item)
+                                for item in skill_inputs]
             except Exception as exc:
                 log.warning("Codex skills/list forceReload failed: %s", exc)
+        try:
+            rid = await _send_request("mcpServerStatus/list", {})
+            result = await _read_response(rid)
+            servers = [{"name": row["name"], "status": "connected" if row.get("tools") else "pending"}
+                       for row in result.get("data", []) if isinstance(row, dict) and isinstance(row.get("name"), str)]
+            yield {"type": "runtime_resources", "agent": "codex",
+                   "skills": [item["name"] for item in skill_inputs], "mcp_servers": servers}
+        except Exception as exc:
+            log.warning("Codex MCP status unavailable: %s", exc)
         if skill_inputs:
             log.info(
                 "Attaching %d Codex workspace skill input(s): %s",
@@ -2359,9 +2115,7 @@ async def _run_agent_sdk(
         if model:
             turn_params["model"] = model
         if effort:
-            resolved = _resolve_effort(model, effort)
-            if resolved:
-                turn_params["effort"] = resolved
+            turn_params["effort"] = effort
         # Full access sandbox for CTF work
         turn_params["sandboxPolicy"] = {"type": "dangerFullAccess"}
 
@@ -3093,6 +2847,15 @@ async def _run_agent_sdk(
                     }
                 continue
 
+            if method == "mcpServer/startupStatus/updated":
+                name = params.get("name") or params.get("serverName") or params.get("server")
+                status = params.get("status")
+                if isinstance(name, str) and isinstance(status, str):
+                    yield {"type": "runtime_resources", "agent": "codex",
+                           "skills": [item["name"] for item in skill_inputs],
+                           "mcp_servers": [{"name": name, "status": {"ready": "connected", "starting": "pending", "error": "failed"}.get(status, status)}]}
+                continue
+
             if method == "item/mcpToolCall/progress":
                 message = params.get("message", "")
                 if message:
@@ -3198,7 +2961,6 @@ async def _run_agent_sdk(
                 "account/updated",
                 "account/rateLimits/updated",
                 "app/list/updated",
-                "mcpServer/startupStatus/updated",
                 "externalAgentConfig/import/completed",
                 "remoteControl/status/changed",
                 "fuzzyFileSearch/sessionUpdated",
@@ -3252,17 +3014,11 @@ async def _run_agent_sdk(
 provider = AgentProvider(
     name="codex",
     label="Codex",
-    models=_discover_models(),
-    default_model="",
-    auth_connect_command="codex login --device-auth",
     badge_mode="model",
     build_command=_build_command,
     normalize_saved_events=_normalize_saved_events,
     normalize_live_event=_normalize_live_event,
-    get_usage_data=_get_usage_data,
-    get_models=_discover_models,
-    effort_levels=_discover_effort_levels(),
-    default_effort="xhigh",
+    effort_levels=("low", "medium", "high", "xhigh", "max"),
     run_agent=_run_agent_sdk,
     set_thread_goal=_set_thread_goal,
     clear_thread_goal=_clear_thread_goal,

@@ -66,23 +66,6 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); }
 .hidden { display: none !important; }
 .text-muted { color: var(--text-muted); font-size: 0.8rem; }
 
-/* === Login === */
-.login-box {
-  max-width: 360px; margin: 22vh auto; padding: 2rem;
-  background: var(--bg-card); border: 1px solid var(--border);
-  border-radius: 12px; text-align: center;
-}
-.login-box h1 { font-size: 1.4rem; font-weight: 700; margin-bottom: 0.2rem; }
-.subtitle { color: var(--text-muted); font-size: 0.8rem; margin-bottom: 1.5rem; }
-.login-box input {
-  width: 100%; padding: 0.6rem 0.75rem; margin-bottom: 0.75rem;
-  background: var(--bg-input); border: 1px solid var(--border);
-  border-radius: 8px; color: var(--text); font-size: 0.85rem;
-  outline: none; transition: border-color 0.15s;
-}
-.login-box input:focus { border-color: var(--accent); }
-.error { color: var(--red); font-size: 0.8rem; margin-top: 0.5rem; }
-
 /* === Buttons === */
 button {
   cursor: pointer; font-size: 0.8rem; border: none; border-radius: 8px;
@@ -1365,27 +1348,6 @@ header h1 { font-size: 0.95rem; font-weight: 600; flex: 1; }
   .btn-sidebar-toggle { display: inline-flex; }
 }
 
-/* === Auth Warning Modal === */
-.auth-warning-modal { max-width: 440px; }
-.auth-warning-intro {
-  font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.75rem;
-  line-height: 1.5;
-}
-.auth-warning-item {
-  display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;
-  flex-wrap: wrap;
-  padding: 0.6rem 0.75rem; margin-bottom: 0.4rem;
-  background: var(--bg-input); border: 1px solid var(--border);
-  border-radius: 8px;
-}
-.auth-warning-agent {
-  font-size: 0.85rem; font-weight: 600;
-}
-.auth-warning-cmd {
-  font-family: var(--mono); font-size: 0.8rem;
-  background: rgba(0,0,0,0.3); padding: 0.2rem 0.5rem;
-  border-radius: 4px; color: var(--yellow);
-}
 
 /* === Usage Page === */
 .usage-page { padding: 1rem; max-width: 960px; margin: 0 auto; }
@@ -1405,73 +1367,15 @@ header h1 { font-size: 0.95rem; font-weight: 600; flex: 1; }
 .usage-agent-name {
   font-size: 1rem; font-weight: 700;
 }
-.usage-auth-info {
+.usage-harness-info {
   display: flex; flex-direction: column; gap: 0.15rem;
   font-size: 0.8rem;
 }
-.usage-auth-actions {
-  margin-top: 0.35rem; display: flex; align-items: center; gap: 0.45rem;
-  flex-wrap: wrap;
-}
-.usage-env-auth {
-  margin-top: 0.6rem; padding-top: 0.6rem; border-top: 1px solid var(--border);
-  display: flex; flex-direction: column; gap: 0.45rem;
-}
-.usage-env-auth-title {
-  font-size: 0.74rem; font-weight: 700; color: var(--text-muted);
-  text-transform: uppercase;
-}
-.usage-env-auth-field {
-  display: grid; grid-template-columns: minmax(150px, 0.42fr) 1fr;
-  align-items: center; gap: 0.45rem; font-size: 0.72rem; color: var(--text-muted);
-}
-.usage-env-auth-field input {
-  min-width: 0; font-family: var(--mono); font-size: 0.72rem;
-}
-.usage-env-auth-actions {
-  display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap;
-}
-.usage-stats {
-  display: flex; flex-direction: column; gap: 0.15rem;
-  font-size: 0.8rem; border-top: 1px solid var(--border);
-  padding-top: 0.5rem;
-}
-.usage-stats:empty { display: none; }
 .usage-challenge-stats {
   display: flex; flex-direction: column; gap: 0.15rem;
   font-size: 0.8rem; border-top: 1px solid var(--border);
   padding-top: 0.5rem;
 }
-.auth-terminal {
-  margin-top: 1rem; background: var(--bg-card); border: 1px solid var(--border);
-  border-radius: 8px; overflow: hidden;
-}
-.auth-terminal-header {
-  display: flex; align-items: center; justify-content: space-between; gap: 1rem;
-  padding: 0.75rem 0.9rem; border-bottom: 1px solid var(--border);
-}
-.auth-terminal-title { font-size: 0.9rem; font-weight: 700; }
-.auth-terminal-subtitle {
-  margin-top: 0.15rem; color: var(--text-muted); font: 0.68rem var(--mono);
-}
-.auth-terminal-output {
-  min-height: 12rem; max-height: 24rem; overflow: auto; padding: 0.85rem;
-  background: var(--bg); color: var(--text); font: 0.76rem/1.45 var(--mono);
-  white-space: pre-wrap; word-break: break-word;
-}
-.auth-terminal-output a {
-  color: var(--accent); text-decoration: underline; text-underline-offset: 2px;
-}
-.auth-terminal-input-row {
-  display: flex; gap: 0.5rem; padding: 0.75rem 0.9rem;
-  border-top: 1px solid var(--border); background: var(--bg-panel);
-}
-.auth-terminal-input-row input {
-  flex: 1; min-width: 0; background: var(--bg-input); color: var(--text);
-  border: 1px solid var(--border); border-radius: 6px; padding: 0.45rem 0.6rem;
-  font: 0.76rem var(--mono); outline: none;
-}
-.auth-terminal-input-row input:focus { border-color: var(--accent); }
 
 .usage-kv {
   display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;
@@ -1481,46 +1385,7 @@ header h1 { font-size: 0.95rem; font-weight: 600; flex: 1; }
   letter-spacing: 0.04em; color: var(--text-muted);
   min-width: 90px; flex-shrink: 0;
 }
-.usage-bar {
-  flex: 1; min-width: 60px; max-width: 160px; height: 6px;
-  background: var(--border); border-radius: 3px; overflow: hidden;
-}
-.usage-bar-fill {
-  display: block; height: 100%; border-radius: 3px;
-  transition: width 0.3s ease;
-}
-.bar-ok   { background: var(--green); }
-.bar-warn { background: var(--yellow); }
-.bar-danger { background: var(--red); }
 
-/* Daily activity chart */
-.usage-section { margin-top: 1rem; }
-.usage-section-title {
-  font-size: 0.8rem; font-weight: 700; text-transform: uppercase;
-  letter-spacing: 0.04em; color: var(--text-muted); margin-bottom: 0.5rem;
-}
-.daily-chart {
-  display: flex; align-items: flex-end; gap: 2px;
-  height: 140px; padding: 0.5rem;
-  background: var(--bg-card); border: 1px solid var(--border);
-  border-radius: 10px;
-}
-.daily-bar-wrap {
-  flex: 1; display: flex; flex-direction: column;
-  align-items: center; height: 100%; justify-content: flex-end;
-  min-width: 0;
-}
-.daily-bar {
-  width: 100%; max-width: 32px; background: var(--accent);
-  border-radius: 3px 3px 0 0; transition: height 0.3s;
-}
-.daily-label {
-  font-size: 0.55rem; color: var(--text-dim); margin-top: 0.2rem;
-  font-family: var(--mono); white-space: nowrap;
-}
-.daily-value {
-  font-size: 0.55rem; color: var(--text-muted); font-family: var(--mono);
-}
 
 .import-progress-panel {
   background: var(--bg-panel); border: 1px solid var(--border);
@@ -1668,6 +1533,7 @@ header h1 { font-size: 0.95rem; font-weight: 600; flex: 1; }
   color: var(--text-muted); font-size: 0.78rem; margin-bottom: 0.75rem;
   line-height: 1.4;
 }
+.gateway-field input,
 .settings-page input[type="text"],
 .settings-page input[type="number"],
 .settings-page input[type="password"],
@@ -1678,7 +1544,7 @@ header h1 { font-size: 0.95rem; font-weight: 600; flex: 1; }
   border: 1px solid var(--border); border-radius: 8px; color: var(--text);
   font-size: 0.85rem; font-family: var(--sans); outline: none;
 }
-.settings-page input:focus, .settings-page select:focus {
+.gateway-field input:focus, .settings-page input:focus, .settings-page select:focus {
   border-color: var(--accent);
 }
 
@@ -1700,6 +1566,18 @@ header h1 { font-size: 0.95rem; font-weight: 600; flex: 1; }
   border: 1px solid var(--border); border-radius: 6px;
   color: var(--text); font-size: 0.75rem;
 }
+.skill-policy { display: flex; flex-wrap: wrap; align-items: center; gap: 0.45rem; margin-bottom: 0.5rem; min-width: 0; }
+.skill-policy label { font-size: 0.72rem; color: var(--text-muted); }
+.skill-policy select { padding: 0.3rem 0.45rem; max-width: 100%; min-width: 0; background: var(--bg-input); color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
+.skill-policy .settings-hint { flex-basis: 100%; margin: 0; }
+.skill-manual-controls { min-width: 0; }
+.skill-manual-controls summary { cursor: pointer; font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+.skill-source { display: block; font-size: 0.62rem; color: var(--text-dim); overflow-wrap: anywhere; }
+.resource-status { font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.5rem; overflow-wrap: anywhere; }
+.resource-status p { margin-bottom: 0.35rem; }
+.resource-error { color: var(--red); }
+.runtime-resources-msg { clear: both; font-size: 0.7rem; color: var(--text-muted); border: 1px solid var(--border); border-radius: 6px; background: var(--bg-panel); padding: 0.45rem 0.65rem; margin: 0.4rem 0; overflow-wrap: anywhere; }
+.runtime-resources-msg .msg-ts { margin-left: 0.5rem; }
 .skill-toolbar {
   display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.5rem;
 }
@@ -1864,3 +1742,22 @@ header h1 { font-size: 0.95rem; font-weight: 600; flex: 1; }
 .advisor-thinking.text-muted { padding: 0.2rem 0; }
 .advisor-input-row { display: flex; gap: 0.4rem; padding: 0.4rem 0.5rem; border-top: 1px solid var(--border); }
 .advisor-input-row textarea { flex: 1; resize: vertical; font-size: 0.74rem; }
+/* Gateway selectors share one model/effort contract across forms and advisor. */
+.gateway-card { margin-bottom: 1rem; padding: 1rem; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-card); display: flex; flex-direction: column; gap: 0.65rem; }
+.gateway-card p, .gateway-banner, .model-effort-note, .usage-harness-info { overflow-wrap: anywhere; }
+.gateway-card p { font-size: 0.76rem; }
+.gateway-field { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.8rem; }
+.gateway-field input { min-width: 0; width: 100%; }
+.gateway-actions, .gateway-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+.gateway-banner { padding: 0.6rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.78rem; }
+[data-gateway-status][data-state="error"], [data-gateway-status][data-state="empty"] { color: var(--red); }
+[data-gateway-status][data-state="ready"] { color: var(--green); }
+.agent-row, .settings-agent-row, .advisor-config { flex-wrap: wrap; min-width: 0; }
+.agent-row-model, .settings-agent-model, .settings-agent-effort, .advisor-select { min-width: 0; max-width: 100%; }
+.agent-row-model, .settings-agent-model { flex: 2 1 12rem; }
+.agent-row-effort, .settings-agent-effort { flex: 1 1 9rem; }
+.model-effort-note { flex: 0 0 100%; font-size: 0.7rem; line-height: 1.4; }
+.advisor-config .advisor-select { flex: 1 1 8rem; }
+select:disabled { opacity: 0.7; }
+@media (max-width: 480px) { .agent-row-model, .settings-agent-model { flex-basis: 100%; } }
+

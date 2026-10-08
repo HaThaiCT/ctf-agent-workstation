@@ -14,16 +14,19 @@ let defaultAgent = null;
 let defaultFlagFormat = "";
 let currentTheme = "dark";
 let chatViewMode = "split";
-let csrfToken = null;
 let agentCatalog = [];
 let agentByName = new Map();
-let agentAuthStatus = {};
-let agentAuthWs = null;
-let activeAgentAuthSession = null;
-let agentAuthOutputText = "";
+let gatewayStatus = { status: 'loading', error: 'Loading 9router models…' };
+let catalogState = 'loading';
+let catalogRequest = 0;
+let defaultsLoaded = false;
 let skillCatalog = [];
 let skillByName = new Map();
 let defaultEnabledSkills = [];
+let defaultSkillsMode = "auto";
+let skillCatalogError = "";
+let resourceStatus = null;
+const skillBindings = new Map();
 let addRunPromptDirty = false;
 let addRunPromptTemplateToken = 0;
 
@@ -34,10 +37,13 @@ let currentRuns = [];               // run objects for current challenge
 let activeRunId = null;             // which run tab is active
 let currentChallengeMode = "single";
 let currentChallengeDefaultSkills = [];
+let currentChallengeSkillsMode = "auto";
 let runSkillModalRunId = null;
 let runGoalModalRunId = null;
 let wsConnections = new Map();      // run_id -> WebSocket
 let globalWs = null;
+let globalWsReconnectTimer = null;
+let appAlive = true;
 let historyLoadingRuns = new Set(); // run_ids currently replaying saved chat history
 const INITIAL_TRANSCRIPT_EVENTS = 50;
 const TRANSCRIPT_PAGE_EVENTS = 200;
@@ -80,7 +86,6 @@ let lastThinkingEl = null;
 
 // === Views ===
 const views = {
-  login: $("#login-view"),
   dashboard: $("#dashboard-view"),
   detail: $("#detail-view"),
   usage: $("#usage-view"),
@@ -99,16 +104,7 @@ function primaryAgentName() {
 }
 
 function getAgentMeta(name) {
-  return agentByName.get(name) || agentCatalog[0] || {
-    name: "claude",
-    label: "Claude",
-    models: [],
-    default_model: "opus",
-    effort_levels: [],
-    default_effort: "",
-    auth_connect_command: "claude auth login",
-    badge_mode: "model",
-  };
+  return agentByName.get(name) || { name, label: name || 'Unavailable harness', models: [], default_model: '', badge_mode: 'model' };
 }
 
 function isParallelMode(mode) {
@@ -119,6 +115,10 @@ function isParallelMode(mode) {
 let enabledAgents = [];
 let agentModels = {};
 let agentEfforts = {};
+let settingsAgentDirty = new Set();
+let settingsEnabledDirty = false;
+let settingsOriginalModels = {};
+let settingsOriginalEfforts = {};
 
 function renderAgentSelect(selectEl) {
   selectEl.innerHTML = agentCatalog.map((agent) =>
@@ -126,112 +126,187 @@ function renderAgentSelect(selectEl) {
   ).join("");
 }
 
-function createAgentRow(agentName, model, effort) {
-  const row = document.createElement("div");
-  row.className = "agent-row";
-
-  const providerSel = document.createElement("select");
-  providerSel.className = "agent-row-provider";
-  providerSel.innerHTML = agentCatalog.map((a) =>
-    `<option value="${esc(a.name)}" ${a.name === agentName ? "selected" : ""}>${esc(a.label)}</option>`
-  ).join("");
-
-  const modelSel = document.createElement("select");
-  modelSel.className = "agent-row-model";
-
-  const effortSel = document.createElement("select");
-  effortSel.className = "agent-row-effort";
-
-  const removeBtn = document.createElement("button");
-  removeBtn.type = "button";
-  removeBtn.className = "agent-row-remove";
-  removeBtn.textContent = "\u00d7";
-  removeBtn.title = "Remove";
-
-  function updateDropdowns() {
-    const meta = getAgentMeta(providerSel.value);
-    const models = meta.models || [];
-    modelSel.innerHTML = models.map((m) =>
-      `<option value="${esc(m.value)}">${esc(m.label)}</option>`
-    ).join("") || '<option value="">Provider default</option>';
-    if (model && models.some((m) => m.value === model)) {
-      modelSel.value = model;
-      model = "";
-    }
-    const efforts = meta.effort_levels || [];
-    if (efforts.length) {
-      effortSel.innerHTML = efforts.map((e) =>
-        `<option value="${esc(e.value)}">${esc(e.label)}</option>`
-      ).join("");
-      effortSel.classList.remove("hidden");
-      if (effort && efforts.some((e) => e.value === effort)) {
-        effortSel.value = effort;
-        effort = "";
-      } else if (meta.default_effort) {
-        effortSel.value = meta.default_effort;
-      }
-    } else {
-      effortSel.innerHTML = "";
-      effortSel.classList.add("hidden");
-    }
+function bindModelEffortControls(agentName, modelSelect, effortSelect, selection = {}, onChange = () => {}) {
+  const host = modelSelect.parentElement;
+  let note = host.querySelector('.model-effort-note');
+  if (!note) {
+    note = document.createElement('span');
+    note.className = 'model-effort-note text-muted';
+    note.setAttribute('role', 'status');
+    host.appendChild(note);
   }
+  modelSelect.setAttribute('aria-label', '9router model');
+  effortSelect.setAttribute('aria-label', 'Model effort');
+  const state = { agentName, model: selection.model, effort: selection.effort, locked: false };
+  const meta = () => getAgentMeta(state.agentName);
+  function render(preserve = false) {
+    const models = meta().models || [];
+    let notice = '';
+    if (!models.some(m => m.value === state.model) && !preserve && models.length) {
+      if (state.model !== undefined) notice = 'Saved model unavailable; selected the current 9router preset. ';
+      state.model = meta().default_model;
+      state.effort = selection.effort;
+    }
+    modelSelect.innerHTML = models.map(m => '<option value="' + esc(m.value) + '" title="' + esc(m.value) + '">' + esc(m.label || m.value) + '</option>').join('');
+    if (state.model !== undefined && !models.some(m => m.value === state.model)) {
+      const opt = new Option('Unavailable: ' + (state.model || '(blank model)'), state.model || '');
+      opt.disabled = true;
+      modelSelect.appendChild(opt);
+    }
+    if (!modelSelect.options.length) modelSelect.add(new Option('No 9router models available', ''));
+    modelSelect.value = state.model ?? '';
+    modelSelect.title = state.model ?? '';
+    const model = models.find(m => m.value === modelSelect.value);
+    const levels = model?.effort_levels || [{ value: state.effort ?? '', label: state.effort ? 'Unavailable model — ' + state.effort : 'Provider-managed' }];
+    if (model?.effort_mode === 'managed') state.effort = '';
+    else if (model && !levels.some(e => e.value === state.effort)) {
+      if (state.effort !== undefined) notice += 'Effort reset to this model’s default. ';
+      const preset = state.effort === undefined ? meta().selected_effort : model?.default_effort;
+      state.effort = levels.some(e => e.value === preset) ? preset : (model?.default_effort ?? '');
+    }
+    effortSelect.innerHTML = levels.map(e => '<option value="' + esc(e.value) + '">' + esc(e.label) + '</option>').join('');
+    effortSelect.value = state.effort ?? '';
+    modelSelect.dataset.unavailable = model ? 'false' : 'true';
+    modelSelect.disabled = state.locked || catalogState !== 'ready' || !models.length;
+    effortSelect.disabled = state.locked || catalogState !== 'ready' || !model || model.effort_mode === 'managed';
+    note.textContent = notice + (model?.effort_note || (!model ? 'Select an available 9router model before starting.' : ''));
+    onChange({ agent: state.agentName, model: modelSelect.value, effort: effortSelect.value });
+  }
+  modelSelect.onchange = () => {
+    state.model = modelSelect.value;
+    state.effort = effortSelect.value;
+    render(true);
+  };
+  effortSelect.onchange = () => { state.effort = effortSelect.value; onChange(state); };
+  const controls = {
+    refresh() {
+      if (state.model !== undefined || modelSelect.value) state.model = modelSelect.value;
+      if (state.effort !== undefined || effortSelect.value) state.effort = effortSelect.value;
+      render(state.model !== undefined);
+    },
+    lock(locked) { state.locked = locked; render(true); },
+    setAgent(name, preset) { state.agentName = name; state.model = preset.model; state.effort = preset.effort; selection = preset; render(); },
+  };
+  modelSelect._gatewayControls = controls;
+  render(selection.preserve === true);
+  return controls;
+}
 
-  providerSel.addEventListener("change", () => { model = ""; effort = ""; updateDropdowns(); });
-  removeBtn.addEventListener("click", () => row.remove());
+function agentPreset(name) {
+  const meta = getAgentMeta(name);
+  return {
+    model: Object.hasOwn(agentModels, name) ? agentModels[name] : (meta.default_model || undefined),
+    effort: Object.hasOwn(agentEfforts, name) ? agentEfforts[name] : meta.selected_effort,
+  };
+}
 
+function createAgentRow(agentName, model, effort) {
+  const row = document.createElement('div');
+  row.className = 'agent-row';
+  const providerSel = document.createElement('select');
+  providerSel.className = 'agent-row-provider';
+  providerSel.setAttribute('aria-label', 'Harness');
+  renderAgentSelect(providerSel);
+  providerSel.value = agentName;
+  const modelSel = document.createElement('select');
+  modelSel.className = 'agent-row-model';
+  const effortSel = document.createElement('select');
+  effortSel.className = 'agent-row-effort';
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'agent-row-remove';
+  removeBtn.textContent = '×';
+  removeBtn.setAttribute('aria-label', 'Remove harness row');
   row.append(providerSel, modelSel, effortSel, removeBtn);
-  updateDropdowns();
+  const controls = bindModelEffortControls(agentName, modelSel, effortSel, {model, effort});
+  providerSel.addEventListener('change', () => controls.setAgent(providerSel.value, agentPreset(providerSel.value)));
+  removeBtn.addEventListener('click', () => row.remove());
   return row;
 }
 
 function addAgentRow(container, agentName, model, effort) {
-  const name = agentName || primaryAgentName();
-  const m = model || agentModels[name] || "";
-  const e = effort || agentEfforts[name] || "";
-  container.appendChild(createAgentRow(name, m, e));
+  const name = agentName || defaultAgent || primaryAgentName();
+  const preset = agentPreset(name);
+  container.appendChild(createAgentRow(name, model ?? preset.model, effort ?? preset.effort));
 }
 
-function populateAgentList(container, btnId) {
-  container.innerHTML = "";
-  if (enabledAgents.length > 0) {
-    for (const name of enabledAgents) {
-      addAgentRow(container, name, agentModels[name] || "", agentEfforts[name] || "");
-    }
-  } else {
-    addAgentRow(container);
-  }
+function populateAgentList(container) {
+  container.innerHTML = '';
+  for (const name of enabledAgents.length ? enabledAgents : [defaultAgent || primaryAgentName()]) addAgentRow(container, name);
 }
 
 function getAgentRows(container) {
-  return Array.from(container.querySelectorAll(".agent-row")).map((row) => ({
-    agent: row.querySelector(".agent-row-provider").value,
-    model: row.querySelector(".agent-row-model").value,
-    effort: row.querySelector(".agent-row-effort")?.value || "",
-  }));
+  const rows = Array.from(container.querySelectorAll('.agent-row'));
+  const error = catalogState !== 'ready' ? (gatewayStatus.error || '9router models are not ready; Refresh models in Settings.')
+    : !rows.length ? 'At least one agent is required'
+    : rows.some(row => row.querySelector('.agent-row-model').dataset.unavailable === 'true') ? 'Select an available 9router model for every harness.' : '';
+  const unavailableHarness = rows.find(row => gatewayStatus.harnesses?.[row.querySelector('.agent-row-provider').value]?.ready === false);
+  if (unavailableHarness) { showToast(gatewayStatus.harnesses[unavailableHarness.querySelector('.agent-row-provider').value].error || 'Native harness unavailable', 'error'); return null; }
+  if (error) { showToast(error, 'error'); return null; }
+  return rows.map(row => ({ agent: row.querySelector('.agent-row-provider').value,
+    model: row.querySelector('.agent-row-model').value, effort: row.querySelector('.agent-row-effort').value }));
 }
 
 function renderUsageShell() {
-  $("#usage-grid").innerHTML = agentCatalog.map((agent) => `
-    <div class="usage-card" id="usage-${esc(agent.name)}">
-      <div class="usage-card-header">
-        <span class="usage-agent-name">${esc(agent.label)}</span>
-        <span id="${esc(agent.name)}-auth-badge" class="badge badge-pending">not connected</span>
-      </div>
-      <div id="${esc(agent.name)}-auth-info" class="usage-auth-info"></div>
-      <div id="${esc(agent.name)}-stats" class="usage-stats"></div>
-      <div id="${esc(agent.name)}-challenge-stats" class="usage-challenge-stats"></div>
-    </div>
-  `).join("");
+  $('#usage-grid').innerHTML = agentCatalog.map(agent => '<div class="usage-card" id="usage-' + esc(agent.name) + '"><div class="usage-card-header"><span class="usage-agent-name">' + esc(agent.label) + '</span><span class="badge" data-harness-status></span></div><div class="usage-harness-info" data-harness-error></div><div class="usage-challenge-stats" data-challenge-stats></div></div>').join('');
 }
 
-async function loadAgentCatalog() {
-  const res = await api("/api/agents");
-  if (!res) return false;
-  const data = await res.json();
-  agentCatalog = data.agents || [];
-  agentByName = new Map(agentCatalog.map((agent) => [agent.name, agent]));
-  renderUsageShell();
-  return true;
+function isAgentCatalogResponse(data) {
+  const gateway = data?.gateway;
+  if (!Array.isArray(data?.agents) || gateway?.provider !== '9router' || !['ready', 'error', 'empty'].includes(gateway.status) || typeof gateway.base_url !== 'string' || !gateway.harnesses) return false;
+  return data.agents.every(agent => {
+    if (!agent || typeof agent.name !== 'string' || !Array.isArray(agent.models)) return false;
+    if (new Set(agent.models.map(model => model?.value)).size !== agent.models.length) return false;
+    return agent.models.every(model => model && typeof model.value === 'string' && model.value && ['managed', 'selectable'].includes(model.effort_mode) && Array.isArray(model.effort_levels) && model.effort_levels.length && model.effort_levels.every(level => level && typeof level.value === 'string' && typeof level.label === 'string'));
+  });
+}
+
+async function loadAgentCatalog(force = false) {
+  const request = ++catalogRequest;
+  catalogState = 'loading';
+  renderGatewayStatus();
+  document.querySelectorAll('select').forEach(sel => sel._gatewayControls?.refresh());
+  try {
+    const res = await api('/api/agents' + (force ? '?refresh=1' : ''));
+    if (!res) throw new Error('9router catalog unavailable');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '9router catalog unavailable');
+    if (!isAgentCatalogResponse(data)) throw new Error('9router returned an invalid model catalog');
+    if (request !== catalogRequest) return false;
+    agentCatalog = data.agents;
+    agentByName = new Map(agentCatalog.map(agent => [agent.name, agent]));
+    gatewayStatus = data.gateway;
+    catalogState = gatewayStatus.status === 'ready' && agentCatalog.some(a => a.models.length) ? 'ready' : gatewayStatus.status === 'empty' ? 'empty' : 'error';
+    renderUsageShell();
+  } catch (error) {
+    if (request !== catalogRequest) return false;
+    catalogState = 'error';
+    gatewayStatus = { ...gatewayStatus, status: 'error', error: error.message };
+  }
+  document.querySelectorAll('select').forEach(sel => sel._gatewayControls?.refresh());
+  renderGatewayStatus();
+  return catalogState === 'ready';
+}
+
+function isLoopbackGateway() {
+  try {
+    const host = new URL(gatewayStatus.base_url).hostname;
+    return host === 'localhost' || host.endsWith('.localhost') || /^127\./.test(host) || host === '[::1]' || host === '::1';
+  } catch (_) { return true; }
+}
+
+function renderGatewayStatus() {
+  const message = catalogState === 'loading' ? 'Loading 9router models…' : catalogState === 'ready' ? '9router catalog ready — native inference is not yet verified.' : gatewayStatus.error || (catalogState === 'empty' ? '9router has no tool-capable models.' : '9router catalog unavailable.');
+  document.querySelectorAll('[data-gateway-status]').forEach(el => { el.textContent = message; el.dataset.state = catalogState; });
+  document.querySelectorAll('[data-gateway-key]').forEach(el => { el.placeholder = gatewayStatus.key_configured ? 'Configured; leave blank to keep' : 'API key'; });
+  document.querySelectorAll('[data-gateway-url]').forEach(el => { if (el.dataset.dirty !== 'true') el.value = gatewayStatus.base_url || 'http://127.0.0.1:20128/v1'; });
+  document.querySelectorAll('[data-gateway-source]').forEach(el => { el.textContent = gatewayStatus.source ? 'Key source: ' + gatewayStatus.source : 'No API key configured'; });
+  document.querySelectorAll('#challenge-form button[type="submit"], #btn-bulk-submit, #btn-import-submit, #btn-add-run-submit, #btn-start, #btn-retry, #btn-resume, #advisor-send, #btn-steer, .split-steer-btn').forEach(btn => { btn.disabled = catalogState !== 'ready' || !defaultsLoaded || btn.dataset.busy === 'true' || (btn.id === 'advisor-send' && advisorThinking); });
+  document.querySelectorAll('#btn-new-challenge, #btn-bulk-upload, #btn-import, #btn-add-run').forEach(btn => { btn.disabled = catalogState === 'loading' || !defaultsLoaded || btn.dataset.busy === 'true'; });
+  const target = $('#challenge-run-target');
+  if (target) {
+    Array.from(target.options).forEach(opt => { if (opt.value !== 'local') { opt.disabled = isLoopbackGateway(); opt.title = opt.disabled ? 'Local 9router is not reachable from swarm workers; select Local' : ''; } });
+  }
 }
 
 function normalizeSkillNames(names) {
@@ -239,7 +314,7 @@ function normalizeSkillNames(names) {
   const seen = new Set();
   const normalized = [];
   for (const name of input) {
-    if (!skillByName.has(name) || seen.has(name)) continue;
+    if (typeof name !== "string" || !name || seen.has(name)) continue;
     seen.add(name);
     normalized.push(name);
   }
@@ -252,36 +327,127 @@ function allSkillNames() {
 
 async function loadSkillCatalog() {
   const res = await api("/api/skills");
-  if (!res) return false;
-  const data = await res.json();
-  skillCatalog = data.skills || [];
-  skillByName = new Map(skillCatalog.map((skill) => [skill.name, skill]));
-  defaultEnabledSkills = normalizeSkillNames(data.default_enabled_skills || allSkillNames());
+  const data = res ? await res.json().catch(() => ({})) : {};
+  if (!res?.ok || !applySkillCatalogPayload(data)) {
+    skillCatalogError = data.error || "Skill catalog unavailable. Retry in Settings.";
+    renderResourceStatus();
+    return false;
+  }
+  skillCatalogError = "";
+  renderResourceStatus();
   return true;
+}
+
+function skillsMode(record, fallback = "auto") {
+  if (["auto", "manual", "inherit"].includes(record?.skills_mode)) return record.skills_mode;
+  return record?.enabled_skills?.length ? "manual" : fallback;
 }
 
 function applySkillCatalogPayload(data) {
   if (!data || !Array.isArray(data.skills)) return false;
   skillCatalog = data.skills;
   skillByName = new Map(skillCatalog.map((skill) => [skill.name, skill]));
-  defaultEnabledSkills = normalizeSkillNames(data.default_enabled_skills || allSkillNames());
+  defaultEnabledSkills = normalizeSkillNames(data.default_enabled_skills ?? []);
+  defaultSkillsMode = skillsMode(data);
   return true;
+}
+
+function initializeSkillControls() {
+  document.querySelectorAll(".skill-checklist").forEach(container => {
+    const allowInherit = ["run-skill-list", "add-run-skill-list"].includes(container.id);
+    const controls = document.createElement("div");
+    controls.className = "skill-policy";
+    controls.innerHTML = '<label for="' + container.id + '-mode">Skill selection</label><select id="' + container.id + '-mode">' + (allowInherit ? '<option value="inherit">Inherit challenge policy</option>' : '') + '<option value="auto">Auto — select needed skills</option><option value="manual">Manual — exact selection</option></select><p class="settings-hint" data-skill-policy-note></p>';
+    const details = document.createElement("details");
+    details.className = "skill-manual-controls";
+    details.innerHTML = '<summary>Advanced: inspect / choose skills</summary>';
+    const toolbar = container.previousElementSibling;
+    container.before(controls, details);
+    if (toolbar?.classList.contains("skill-toolbar")) details.appendChild(toolbar);
+    details.appendChild(container);
+    const binding = { controls, details, select: controls.querySelector("select"), mode: allowInherit ? "inherit" : "auto" };
+    skillBindings.set(container.id, binding);
+    binding.select.addEventListener("change", () => {
+      setSkillMode(container, binding.select.value);
+      skillPolicyChanged(container);
+    });
+    container.addEventListener("change", e => {
+      if (!e.target.classList.contains("skill-cb")) return;
+      setSkillMode(container, "manual");
+      skillPolicyChanged(container);
+    });
+    setSkillMode(container, binding.mode);
+  });
+}
+
+function skillPolicyChanged(container) {
+  if (container.id === "bulk-skill-list") updateChallengeSkillSummaries("bulk");
+  if (container.id === "import-skill-list") updateChallengeSkillSummaries("import");
+  if (container.id === "add-run-skill-list" && !addRunPromptDirty) refreshAddRunPromptTemplate({ preserveDirty: true, silent: true });
+}
+
+function setSkillMode(container, mode) {
+  const binding = skillBindings.get(container?.id);
+  if (!binding) return;
+  binding.mode = mode;
+  binding.select.value = mode;
+  binding.controls.querySelector("[data-skill-policy-note]").textContent = mode === "auto"
+    ? "The runtime selects related skills automatically when the run starts. Checkbox selections are ignored in Auto."
+    : mode === "inherit" ? "Use the challenge's Auto or Manual policy, including future automatic selections."
+    : "Only checked skills will be enabled. An empty selection enables none.";
+  binding.details.open = mode === "manual";
+}
+
+function bindSkillSelection(container, selection = {}) {
+  renderSkillChecklist(container, selection.enabled_skills ?? []);
+  setSkillMode(container, skillsMode(selection));
+}
+
+function skillSelectionPayload(container) {
+  const mode = skillBindings.get(container?.id)?.mode || "auto";
+  return mode === "manual"
+    ? { skills_mode: mode, enabled_skills: getSelectedSkills(container) }
+    : { skills_mode: mode };
+}
+
+function appendSkillSelection(form, container) {
+  for (const [key, value] of Object.entries(skillSelectionPayload(container))) {
+    form.append(key, Array.isArray(value) ? JSON.stringify(value) : value);
+  }
+}
+
+async function loadResources() {
+  const res = await api("/api/resources");
+  const data = res ? await res.json().catch(() => ({})) : {};
+  resourceStatus = res?.ok && Array.isArray(data.mcp)
+    ? data : { error: data.error || "Runtime resource status unavailable." };
+  renderResourceStatus();
+}
+
+function renderResourceStatus() {
+  const container = $("#settings-resource-status");
+  if (!container) return;
+  const catalog = resourceStatus?.category_catalog;
+  const errors = [skillCatalogError, resourceStatus?.error, catalog?.error].filter(Boolean);
+  container.innerHTML = '<p>Sources: repository skills, automatic category cache, uploaded app skills / all-skills.</p><p>' + skillCatalog.length + ' discovered skills. Category catalog: ' + esc(catalog?.status || "not loaded") + '.</p>' + errors.map(error => '<p class="resource-error">' + esc(error) + '</p>').join('') + (resourceStatus?.mcp || []).map(server => '<p><strong>' + esc(server.name) + '</strong> · ' + esc(server.source) + ' · ' + (server.available ? 'Available (not connected; starts with a native run)' : 'Unavailable') + (server.error ? ' — ' + esc(server.error) : '') + '</p>').join('');
 }
 
 function renderSkillChecklist(container, selectedNames) {
   if (!container) return;
   const selected = new Set(normalizeSkillNames(selectedNames));
-  if (!skillCatalog.length) {
-    container.innerHTML = `<div class="settings-hint">No skills found.</div>`;
+  if (!skillCatalog.length && !selected.size) {
+    container.innerHTML = `<div class="settings-hint">${esc(skillCatalogError || "No skills found.")}</div>`;
     return;
   }
-  container.innerHTML = skillCatalog.map((skill) => {
+  const rows = [...skillCatalog, ...Array.from(selected).filter(name => !skillByName.has(name)).map(name => ({ name, description: "Unavailable in the current catalog; retained selection." }))];
+  container.innerHTML = rows.map((skill) => {
     const checked = selected.has(skill.name) ? "checked" : "";
     const desc = skill.description || "";
     return `<label class="skill-check">
       <input type="checkbox" class="skill-cb" value="${esc(skill.name)}" ${checked}>
       <span>
         <span class="skill-name">${esc(skill.name)}</span>
+        <span class="skill-source">${esc(skill.category || "")} ${esc(skill.source || "")}</span>
         ${desc ? `<span class="skill-desc">${esc(desc)}</span>` : ""}
       </span>
     </label>`;
@@ -326,6 +492,7 @@ document.addEventListener("click", (e) => {
   if (!btn) return;
   const container = document.querySelector(btn.dataset.skillTarget || "");
   if (!container) return;
+  setSkillMode(container, "manual");
   const action = btn.dataset.skillAction;
   if (action === "all") setSkillChecklist(container, allSkillNames());
   if (action === "none") setSkillChecklist(container, []);
@@ -333,9 +500,8 @@ document.addEventListener("click", (e) => {
   if (action === "challenge-defaults") {
     setSkillChecklist(container, currentChallengeDefaultSkills);
   }
-  if (container.id === "add-run-skill-list" && !addRunPromptDirty) {
-    refreshAddRunPromptTemplate({ preserveDirty: true });
-  }
+  skillPolicyChanged(container);
+
 });
 
 async function uploadSettingsSkill() {
@@ -376,6 +542,7 @@ async function uploadSettingsSkill() {
     ? normalizeSkillNames([...selectedBeforeUpload, uploadedName])
     : normalizeSkillNames(selectedBeforeUpload);
   renderSkillChecklist($("#settings-skill-list"), selectedAfterUpload);
+  await loadResources();
   input.value = "";
   result.textContent = uploadedName ? `Uploaded ${uploadedName}` : "Uploaded";
   showToast(result.textContent, "success");
@@ -384,13 +551,56 @@ async function uploadSettingsSkill() {
 // === API ===
 async function api(path, opts = {}) {
   const headers = { ...opts.headers };
-  if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
-  if (!(opts.body instanceof FormData)) {
-    headers["Content-Type"] = headers["Content-Type"] || "application/json";
+  if (!(opts.body instanceof FormData)) headers['Content-Type'] = headers['Content-Type'] || 'application/json';
+  try {
+    const res = await fetch(path, { ...opts, headers });
+    if (!res.ok && (res.status === 401 || (opts.method && opts.method !== 'GET'))) {
+      const error = await res.clone().json().catch(() => ({}));
+      showToast(error.error || (res.status === 401 ? 'Request rejected (401). Check the server or upstream service configuration.' : 'Request failed (' + res.status + ')'), 'error');
+    }
+    return res;
+  } catch (error) {
+    showToast('Request failed: ' + error.message, 'error');
+    return null;
   }
-  const res = await fetch(path, { ...opts, headers });
-  if (res.status === 401) { window.location.reload(); return null; }
-  return res;
+}
+
+async function withBusy(button, action, text) {
+  if (button.dataset.busy === 'true') return;
+  const oldText = button.textContent;
+  button.dataset.busy = 'true';
+  button.disabled = true;
+  if (text) button.textContent = text;
+  try { return await action(); }
+  catch (error) { showToast(error.message || 'Request failed', 'error'); }
+  finally {
+    delete button.dataset.busy;
+    button.disabled = false;
+    button.textContent = oldText;
+    renderGatewayStatus();
+  }
+}
+
+function initializeGatewayCards() {
+  document.querySelectorAll('[data-gateway-card]').forEach(card => {
+    card.innerHTML = '<h2 class="settings-section-title">Model provider: 9router</h2><p data-gateway-status role="status" aria-live="polite"></p><label class="gateway-field"><span>Gateway URL</span><input type="url" data-gateway-url placeholder="http://127.0.0.1:20128/v1"></label><label class="gateway-field"><span>API key</span><input type="password" data-gateway-key autocomplete="off" placeholder="API key"></label><div class="gateway-actions"><button type="button" data-gateway-save class="btn-secondary btn-sm">Save provider</button><button type="button" data-gateway-refresh class="btn-ghost btn-sm">Refresh models / Retry</button><span data-gateway-source class="text-muted"></span></div><p class="text-muted">Both native harnesses use this provider. Blank key keeps the current source; launcher paths are detected automatically.</p>';
+    card.querySelector('[data-gateway-url]').addEventListener('input', e => { e.target.dataset.dirty = 'true'; });
+    card.querySelector('[data-gateway-save]').addEventListener('click', e => withBusy(e.currentTarget, async () => {
+      const key = card.querySelector('[data-gateway-key]');
+      const url = card.querySelector('[data-gateway-url]');
+      const res = await api('/api/agents/gateway', { method: 'PUT', body: JSON.stringify({ base_url: url.value.trim(), api_key: key.value.trim() }) });
+      if (!res) return;
+      const data = await res.json();
+      if (data.provider === '9router') gatewayStatus = data;
+      if (!res.ok) return;
+      key.value = '';
+      delete url.dataset.dirty;
+      await loadAgentCatalog();
+      if (catalogState === 'ready') showToast('9router provider saved', 'success');
+    }, 'Saving…'));
+  });
+  document.querySelectorAll('[data-gateway-refresh]').forEach(btn => btn.addEventListener('click', () => withBusy(btn, async () => { await loadAgentCatalog(true); await loadUsage(); }, 'Refreshing…')));
+  renderGatewayStatus();
 }
 
 function newestConnectionSync(connections) {
@@ -487,44 +697,10 @@ function renderMetadataSyncAge() {
   el.title = metadataLastSyncAt.toLocaleString();
 }
 
-// === Login ===
-$("#login-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const pw = $("#login-password").value;
-  const loginRes = await fetch("/api/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ password: pw }),
-  });
-  if (loginRes.ok) {
-    const data = await loginRes.json();
-    csrfToken = data.csrf_token;
-    if (await loadAgentCatalog() && await loadSkillCatalog()) {
-      showView("dashboard");
-      connectGlobalWS();
-      await handleDeepLink();
-      loadDefaultAgent();
-    }
-  } else {
-    const err = await loginRes.json().catch(() => ({}));
-    $("#login-error").textContent = err.error || "Invalid password";
-    $("#login-error").classList.remove("hidden");
-  }
-});
-
-$("#btn-logout").addEventListener("click", async () => {
-  await api("/api/logout", { method: "POST" });
-  disconnectAllWS();
-  disconnectGlobalWS();
-  csrfToken = null;
-  currentChallengeId = null;
-  showView("login");
-});
-
 // === Default Agent / Settings ===
 async function loadDefaultAgent() {
   const res = await api("/api/settings");
-  if (!res) return;
+  if (!res || !res.ok) { showToast('Unable to load saved harness presets; reload to retry.', 'error'); return; }
   const settings = await res.json();
   defaultAgent = settings.default_agent || primaryAgentName();
   if (!agentByName.has(defaultAgent)) defaultAgent = primaryAgentName();
@@ -536,8 +712,11 @@ async function loadDefaultAgent() {
     : [defaultAgent];
   agentModels = settings.agent_models || {};
   agentEfforts = settings.agent_efforts || {};
-  defaultEnabledSkills = normalizeSkillNames(settings.enabled_skills || allSkillNames());
+  defaultEnabledSkills = normalizeSkillNames(settings.enabled_skills ?? []);
+  defaultSkillsMode = skillsMode(settings);
   applyTheme(currentTheme);
+  defaultsLoaded = true;
+  renderGatewayStatus();
 }
 
 function applyTheme(theme) {
@@ -545,51 +724,6 @@ function applyTheme(theme) {
 }
 
 
-// === Agent Auth Check ===
-async function checkAgentAuth() {
-  const res = await api("/api/agents/auth/status");
-  if (!res) return;
-  const data = await res.json();
-  const statuses = data.agents || {};
-  const missing = agentCatalog
-    .filter((agent) => !statuses[agent.name]?.connected)
-    .map((agent) => ({
-      agent: agent.name,
-      name: agent.label,
-      command: statuses[agent.name]?.command || agent.auth_connect_command,
-    }));
-
-  if (missing.length === 0) return;
-
-  const container = $("#auth-warning-items");
-  container.innerHTML = missing.map((m) => `
-    <div class="auth-warning-item">
-      <span class="auth-warning-agent">${esc(m.name)}</span>
-      <code class="auth-warning-cmd">${esc(m.command)}</code>
-      <button type="button" class="btn-ghost btn-sm auth-warning-login" data-agent="${esc(m.agent)}">Login</button>
-    </div>
-  `).join("");
-  container.querySelectorAll(".auth-warning-login").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      $("#auth-warning-overlay").classList.add("hidden");
-      showView("usage");
-      loadUsage().then(() => startAgentAuth(btn.dataset.agent || ""));
-    });
-  });
-
-  $("#auth-warning-overlay").classList.remove("hidden");
-}
-
-$("#auth-warning-close").addEventListener("click", () => {
-  $("#auth-warning-overlay").classList.add("hidden");
-});
-$("#auth-warning-dismiss").addEventListener("click", () => {
-  $("#auth-warning-overlay").classList.add("hidden");
-});
-$("#auth-warning-overlay").addEventListener("click", (e) => {
-  if (e.target === $("#auth-warning-overlay"))
-    $("#auth-warning-overlay").classList.add("hidden");
-});
 
 // === Dashboard ===
 async function loadChallenges() {
@@ -715,6 +849,8 @@ function enterExportMode() {
   $("#challenges-list").classList.add("export-mode");
   $("#export-bar").classList.remove("hidden");
   $("#btn-export-mode").textContent = "Cancel Export";
+  const btnSel = $("#btn-select-mode");
+  if (btnSel) btnSel.textContent = "Cancel";
   updateExportCount();
 }
 
@@ -724,6 +860,8 @@ function exitExportMode() {
   $("#challenges-list").classList.remove("export-mode");
   $("#export-bar").classList.add("hidden");
   $("#btn-export-mode").textContent = "Export";
+  const btnSel = $("#btn-select-mode");
+  if (btnSel) btnSel.textContent = "Select";
   document.querySelectorAll(".challenge-card.export-selected").forEach(
     (c) => c.classList.remove("export-selected")
   );
@@ -733,6 +871,8 @@ function updateExportCount() {
   const n = exportSelected.size;
   $("#export-count").textContent = `${n} selected`;
   $("#btn-export-download").disabled = n === 0;
+  const btnDel = $("#btn-delete-selected");
+  if (btnDel) btnDel.disabled = n === 0;
 }
 
 function toggleExportCard(card) {
@@ -751,6 +891,57 @@ $("#btn-export-mode").addEventListener("click", () => {
   if (exportMode) exitExportMode();
   else enterExportMode();
 });
+
+const btnSelectMode = $("#btn-select-mode");
+if (btnSelectMode) {
+  btnSelectMode.addEventListener("click", () => {
+    if (exportMode) exitExportMode();
+    else enterExportMode();
+  });
+}
+
+const btnDeleteSelected = $("#btn-delete-selected");
+if (btnDeleteSelected) {
+  btnDeleteSelected.addEventListener("click", async () => {
+    const count = exportSelected.size;
+    if (!count) {
+      showToast("No challenges selected", "error");
+      return;
+    }
+    if (!confirm(`Delete ${count} selected challenge(s) and their sessions? This cannot be undone.`)) return;
+    const res = await api("/api/challenges/delete-bulk", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: Array.from(exportSelected) }),
+    });
+    if (res && res.ok) {
+      showToast(`Deleted ${count} challenge(s)`, "success");
+      exitExportMode();
+      loadChallenges();
+    } else {
+      showToast((res && res.error) || "Failed to delete challenges", "error");
+    }
+  });
+}
+
+const btnClearAll = $("#btn-clear-all");
+if (btnClearAll) {
+  btnClearAll.addEventListener("click", async () => {
+    if (!confirm("Are you sure you want to delete ALL challenges and all sessions? This will completely clear the workstation. This cannot be undone.")) return;
+    const res = await api("/api/challenges/delete-bulk", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ all: true }),
+    });
+    if (res && res.ok) {
+      showToast("Cleared all challenges and sessions", "success");
+      if (exportMode) exitExportMode();
+      loadChallenges();
+    } else {
+      showToast((res && res.error) || "Failed to clear challenges", "error");
+    }
+  });
+}
 
 $("#btn-export-cancel").addEventListener("click", () => exitExportMode());
 
@@ -953,7 +1144,7 @@ async function triggerSync(connId) {
 
   // Set up preview controls using saved agent settings
   populateAgentList($("#import-agent-list"));
-  renderSkillChecklist($("#import-skill-list"), defaultEnabledSkills);
+  bindSkillSelection($("#import-skill-list"), { skills_mode: defaultSkillsMode, enabled_skills: defaultEnabledSkills });
   $("#import-flag").value = defaultFlagFormat;
 
   renderImportPreview();
@@ -1039,7 +1230,7 @@ $("#add-challenge-menu").addEventListener("click", (e) => {
 // === New Challenge Modal ===
 $("#btn-new-challenge").addEventListener("click", () => {
   populateAgentList($("#challenge-agent-list"));
-  renderSkillChecklist($("#challenge-skill-list"), defaultEnabledSkills);
+  bindSkillSelection($("#challenge-skill-list"), { skills_mode: defaultSkillsMode, enabled_skills: defaultEnabledSkills });
   $("#challenge-flag").value = defaultFlagFormat;
   populateRunTargets();
   $("#modal-overlay").classList.remove("hidden");
@@ -1064,6 +1255,7 @@ async function populateRunTargets() {
     }
   } catch (_) { /* swarm not configured — local only */ }
   sel.innerHTML = options;
+  renderGatewayStatus();
 }
 $("#modal-close").addEventListener("click", closeModal);
 $("#modal-overlay").addEventListener("click", (e) => {
@@ -1172,6 +1364,7 @@ function updateFileList() {
 $("#challenge-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const agents = getAgentRows($("#challenge-agent-list"));
+  if (!agents) return;
   const mode = agents.length > 1 ? "parallel" : "single";
   const fd = new FormData();
   fd.append("name", $("#challenge-name").value);
@@ -1179,7 +1372,7 @@ $("#challenge-form").addEventListener("submit", async (e) => {
   fd.append("flag_format", $("#challenge-flag").value);
   fd.append("mode", mode);
   fd.append("agents", JSON.stringify(agents));
-  fd.append("enabled_skills", JSON.stringify(getSelectedSkills($("#challenge-skill-list"))));
+  appendSkillSelection(fd, $("#challenge-skill-list"));
   const runTarget = $("#challenge-run-target");
   if (runTarget) fd.append("swarm_instance", runTarget.value || "local");
 
@@ -1187,19 +1380,14 @@ $("#challenge-form").addEventListener("submit", async (e) => {
     fd.append("files", upload.file, upload.path);
   }
 
-  const res = await api("/api/challenges", { method: "POST", body: fd });
-  if (res.ok) {
+  await withBusy(e.submitter || $('#challenge-form button[type="submit"]'), async () => {
+    const res = await api('/api/challenges', { method: 'POST', body: fd });
+    if (!res || !res.ok) return;
     const data = await res.json();
     closeModal(); loadChallenges();
-    if (data.id) {
-      openChallenge(data.id);
-    } else if (data.created) {
-      openChallenge(data.created[0].id);
-    }
-    return;
-  }
-  const err = await res.json().catch(() => ({}));
-  showToast(err.error || "Failed to create challenge", "error");
+    if (data.id) openChallenge(data.id);
+    else if (data.created?.length) openChallenge(data.created[0].id);
+  }, 'Creating…');
 });
 
 // === Bulk Upload ===
@@ -1218,14 +1406,14 @@ function challengeSkillOverrideMap(kind) {
     : bulkChallengeSkillOverrides;
 }
 
-function challengeSkillDefaultList(kind) {
-  return getSelectedSkills(kind === "import" ? $("#import-skill-list") : $("#bulk-skill-list"));
+function challengeSkillDefaultSelection(kind) {
+  return skillSelectionPayload(kind === "import" ? $("#import-skill-list") : $("#bulk-skill-list"));
 }
 
-function challengeSkillSummaryText(skills) {
-  const count = normalizeSkillNames(skills).length;
-  if (!count) return "No skills";
-  return `${count} skill${count !== 1 ? "s" : ""}`;
+function challengeSkillSummaryText(selection) {
+  if (selection.skills_mode === "auto") return "Auto skills";
+  const count = normalizeSkillNames(selection.enabled_skills).length;
+  return count ? `Manual: ${count} skill${count !== 1 ? "s" : ""}` : "Manual: none";
 }
 
 function updateChallengeSkillSummary(kind, index) {
@@ -1237,7 +1425,7 @@ function updateChallengeSkillSummary(kind, index) {
   const hasOverride = overrideMap.has(index);
   summary.textContent = hasOverride
     ? challengeSkillSummaryText(overrideMap.get(index))
-    : "Default skills";
+    : "Default: " + challengeSkillSummaryText(challengeSkillDefaultSelection(kind));
   summary.classList.toggle("challenge-skill-summary-override", hasOverride);
 }
 
@@ -1251,10 +1439,10 @@ function openChallengeCreateSkillModal(kind, index, name) {
   const overrideMap = challengeSkillOverrideMap(kind);
   const selected = overrideMap.has(index)
     ? overrideMap.get(index)
-    : challengeSkillDefaultList(kind);
+    : challengeSkillDefaultSelection(kind);
   challengeSkillEditTarget = { kind, index };
   $("#challenge-create-skill-subtitle").textContent = name || "Challenge";
-  renderSkillChecklist($("#challenge-create-skill-list"), selected);
+  bindSkillSelection($("#challenge-create-skill-list"), selected);
   $("#challenge-create-skill-overlay").classList.remove("hidden");
 }
 
@@ -1268,7 +1456,7 @@ function applyChallengeCreateSkillOverride() {
   const { kind, index } = challengeSkillEditTarget;
   challengeSkillOverrideMap(kind).set(
     index,
-    getSelectedSkills($("#challenge-create-skill-list")),
+    skillSelectionPayload($("#challenge-create-skill-list")),
   );
   updateChallengeSkillSummary(kind, index);
   closeChallengeCreateSkillModal();
@@ -1321,7 +1509,7 @@ function resetBulkModal() {
 $("#btn-bulk-upload").addEventListener("click", () => {
   resetBulkModal();
   populateAgentList($("#bulk-agent-list"));
-  renderSkillChecklist($("#bulk-skill-list"), defaultEnabledSkills);
+  bindSkillSelection($("#bulk-skill-list"), { skills_mode: defaultSkillsMode, enabled_skills: defaultEnabledSkills });
   $("#bulk-flag").value = defaultFlagFormat;
   bulkOverlay.classList.remove("hidden");
 });
@@ -1436,6 +1624,7 @@ $("#btn-bulk-submit").addEventListener("click", async () => {
   if (!bulkPreviewToken) return;
 
   const agentRows = getAgentRows($("#bulk-agent-list"));
+  if (!agentRows) return;
   const mode = agentRows.length > 1 ? "parallel" : "single";
   const rows = document.querySelectorAll(".bulk-ch-row");
   const challengeConfigs = Array.from(rows).map((row, i) => {
@@ -1447,12 +1636,13 @@ $("#btn-bulk-submit").addEventListener("click", async () => {
       enabled: row.querySelector(".bulk-ch-enabled").checked,
     };
     if (bulkChallengeSkillOverrides.has(i)) {
-      cfg.enabled_skills = bulkChallengeSkillOverrides.get(i);
+      Object.assign(cfg, bulkChallengeSkillOverrides.get(i));
     }
     return cfg;
   });
 
   const btn = $("#btn-bulk-submit");
+  btn.dataset.busy = 'true';
   btn.disabled = true;
   btn.textContent = "Creating...";
   try {
@@ -1463,16 +1653,12 @@ $("#btn-bulk-submit").addEventListener("click", async () => {
         flag_format: $("#bulk-flag").value.trim(),
         mode: mode,
         agents: JSON.stringify(agentRows),
-        enabled_skills: getSelectedSkills($("#bulk-skill-list")),
-        model: "",
-        effort: "",
+        ...skillSelectionPayload($("#bulk-skill-list")),
         paused: $("#bulk-paused") ? $("#bulk-paused").checked : false,
         challenges: challengeConfigs,
       }),
     });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      showToast(err.error || "Upload failed", "error");
+    if (!res || !res.ok) {
       return;
     }
     const data = await res.json();
@@ -1480,7 +1666,8 @@ $("#btn-bulk-submit").addEventListener("click", async () => {
     closeBulkModal();
     loadChallenges();
   } finally {
-    btn.disabled = false;
+    delete btn.dataset.busy;
+    renderGatewayStatus();
     updateBulkSubmitLabel();
   }
 });
@@ -1556,7 +1743,9 @@ async function openChallenge(id) {
     : "";
   renderFlagFormats();
   $("#detail-files").textContent = c.files.length ? `Files: ${c.files.join(", ")}` : "No files";
-  currentChallengeDefaultSkills = normalizeSkillNames(c.enabled_skills || []);
+  currentChallengeDefaultSkills = normalizeSkillNames(c.enabled_skills ?? []);
+  currentChallengeSkillsMode = skillsMode(c);
+  $("#detail-skill-mode").textContent = currentChallengeSkillsMode === "auto" ? "Auto — effective skills" : "Manual — exact skills";
   renderSkillReadonlyList($("#detail-skill-list"), currentChallengeDefaultSkills);
 
   const errorBanner = $("#error-banner");
@@ -1710,41 +1899,26 @@ $("#btn-back").addEventListener("click", () => {
   showView("dashboard"); loadChallenges();
 });
 
-$("#btn-start").addEventListener("click", async () => {
+async function solveChallenge(button, { retry = false, resume = false } = {}) {
   if (!currentChallengeId) return;
-  const res = await api(`/api/challenges/${currentChallengeId}/solve`, { method: "POST" });
-  if (res && res.ok) {
-    markRunsSolving();
-    updateStatusBadge("solving"); updateButtons("solving"); startTimer();
-  }
-});
-
-$("#btn-retry").addEventListener("click", async () => {
-  if (!currentChallengeId) return;
-  initRunTabs([]);
-  $("#error-banner").classList.add("hidden");
-  foundFlags.clear(); flagDetails.clear(); $("#flags-list").innerHTML = ""; $("#flags-section").classList.add("hidden");
-  stepCount = 0;
-  lastThinkingEl = null;
-  pendingTools.clear(); runToolCounts.clear(); runStepCounts.clear(); runStats.clear(); statsUseSnapshot = false; updateCounters();
-  const res = await api(`/api/challenges/${currentChallengeId}/solve`, { method: "POST" });
-  if (res && res.ok) {
-    markRunsSolving("", { reset: true });
-    updateStatusBadge("solving"); updateButtons("solving"); startTimer();
-    // Re-open to pick up new runs from the server
-    openChallenge(currentChallengeId);
-  }
-});
-
-$("#btn-resume").addEventListener("click", async () => {
-  if (!currentChallengeId) return;
-  const res = await api(`/api/challenges/${currentChallengeId}/solve?resume=1`, { method: "POST" });
-  if (res && res.ok) {
-    markRunsSolving();
-    updateStatusBadge("solving"); updateButtons("solving"); startTimer();
-    openChallenge(currentChallengeId);
-  }
-});
+  await withBusy(button, async () => {
+    const res = await api('/api/challenges/' + currentChallengeId + '/solve' + (resume ? '?resume=1' : ''), { method: 'POST' });
+    if (!res || !res.ok) return;
+    if (retry) {
+      initRunTabs([]);
+      $('#error-banner').classList.add('hidden');
+      foundFlags.clear(); flagDetails.clear(); $('#flags-list').innerHTML = ''; $('#flags-section').classList.add('hidden');
+      stepCount = 0; lastThinkingEl = null;
+      pendingTools.clear(); runToolCounts.clear(); runStepCounts.clear(); runStats.clear(); statsUseSnapshot = false; updateCounters();
+    }
+    markRunsSolving('', { reset: retry });
+    updateStatusBadge('solving'); updateButtons('solving'); startTimer();
+    if (retry || resume) await openChallenge(currentChallengeId);
+  });
+}
+$('#btn-start').addEventListener('click', e => solveChallenge(e.currentTarget));
+$('#btn-retry').addEventListener('click', e => solveChallenge(e.currentTarget, {retry: true}));
+$('#btn-resume').addEventListener('click', e => solveChallenge(e.currentTarget, {resume: true}));
 
 $("#btn-unsolve").addEventListener("click", async () => {
   if (!currentChallengeId) return;
@@ -1813,7 +1987,7 @@ async function refreshAddRunPromptTemplate(options = {}) {
     {
       method: "POST",
       body: JSON.stringify({
-        enabled_skills: getSelectedSkills($("#add-run-skill-list")),
+        ...skillSelectionPayload($("#add-run-skill-list")),
       }),
     }
   );
@@ -1832,8 +2006,8 @@ function openAddRunModal() {
   const list = $("#add-run-agent-list");
   list.innerHTML = "";
   const name = defaultAgent || primaryAgentName();
-  addAgentRow(list, name, agentModels[name] || "", agentEfforts[name] || "");
-  renderSkillChecklist($("#add-run-skill-list"), currentChallengeDefaultSkills);
+  addAgentRow(list, name);
+  bindSkillSelection($("#add-run-skill-list"), { skills_mode: "inherit", enabled_skills: currentChallengeDefaultSkills });
   addRunPromptDirty = false;
   $("#add-run-prompt").value = "Loading prompt template...";
   $("#add-run-overlay").classList.remove("hidden");
@@ -1846,36 +2020,16 @@ function closeAddRunModal() {
 
 async function submitAddRun() {
   if (!currentChallengeId) return;
-  const agents = getAgentRows($("#add-run-agent-list"));
-  if (!agents.length) {
-    showToast("Add at least one agent", "error");
-    return;
-  }
-  const btn = $("#btn-add-run-submit");
-  const oldText = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = "Adding...";
-  const res = await api(`/api/challenges/${currentChallengeId}/runs`, {
-    method: "POST",
-    body: JSON.stringify({
-      agents,
-      prompt: $("#add-run-prompt").value.trim(),
-      prompt_mode: "full",
-      enabled_skills: getSelectedSkills($("#add-run-skill-list")),
-    }),
-  });
-  btn.disabled = false;
-  btn.textContent = oldText;
-  if (!res) return;
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.error) {
-    showToast(data.error || "Failed to add agent", "error");
-    return;
-  }
-  closeAddRunModal();
-  const count = (data.runs || []).length;
-  showToast(`Added ${count} agent${count === 1 ? "" : "s"}`, "success");
-  openChallenge(currentChallengeId);
+  const agents = getAgentRows($('#add-run-agent-list'));
+  if (!agents) return;
+  await withBusy($('#btn-add-run-submit'), async () => {
+    const res = await api('/api/challenges/' + currentChallengeId + '/runs', { method: 'POST', body: JSON.stringify({ agents, prompt: $('#add-run-prompt').value.trim(), prompt_mode: 'full', ...skillSelectionPayload($('#add-run-skill-list')) }) });
+    if (!res || !res.ok) return;
+    const data = await res.json();
+    closeAddRunModal();
+    showToast('Added ' + (data.runs || []).length + ' agent(s)', 'success');
+    await openChallenge(currentChallengeId);
+  }, 'Adding…');
 }
 
 $("#btn-add-flag-format").addEventListener("click", addFlagFormatAndScan);
@@ -1928,7 +2082,10 @@ function connectAllRuns(challengeId, runs) {
 }
 
 function connectGlobalWS() {
+  if (!appAlive) return;
   if (globalWs && globalWs.readyState <= WebSocket.OPEN) return;
+  clearTimeout(globalWsReconnectTimer);
+  globalWsReconnectTimer = null;
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   globalWs = new WebSocket(`${proto}//${location.host}/ws/events`);
   globalWs.onmessage = (e) => {
@@ -1962,11 +2119,13 @@ function connectGlobalWS() {
   };
   globalWs.onclose = () => {
     globalWs = null;
-    if (csrfToken) setTimeout(connectGlobalWS, 3000);
+    if (appAlive) globalWsReconnectTimer = setTimeout(connectGlobalWS, 3000);
   };
 }
 
 function disconnectGlobalWS() {
+  clearTimeout(globalWsReconnectTimer);
+  globalWsReconnectTimer = null;
   if (!globalWs) return;
   globalWs.onclose = null;
   globalWs.close();
@@ -2943,13 +3102,14 @@ function updateRunFromSummary(summary) {
   if (!run) return;
   const wasSolving = run.status === "solving";
   run.agent = summary.agent || run.agent;
-  run.model = summary.model || run.model;
-  run.effort = summary.effort || run.effort || "";
+  if (Object.hasOwn(summary, 'model')) run.model = summary.model ?? '';
+  if (Object.hasOwn(summary, 'effort')) run.effort = summary.effort ?? '';
   run.status = summary.status || run.status;
   run.error = summary.error || null;
   run.duration_ms = durationMs(summary.duration_ms);
-  run.enabled_skills = normalizeSkillNames(summary.enabled_skills || []);
-  run.skill_override = !!summary.skill_override;
+  if (Object.hasOwn(summary, "enabled_skills")) run.enabled_skills = normalizeSkillNames(summary.enabled_skills);
+  if (Object.hasOwn(summary, "skills_mode")) run.skills_mode = summary.skills_mode;
+  if (Object.hasOwn(summary, "skill_override")) run.skill_override = !!summary.skill_override;
   run.goal = normalizeRunGoal(summary.goal);
   run.goal_editable = !!summary.goal_editable;
   if (run.status === "solving") {
@@ -2976,21 +3136,14 @@ function openRunSkillsModal(runId) {
   const challengeSolved = $("#detail-status").textContent === "solved";
   $("#run-skill-inheritance").textContent = challengeSolved
     ? "This challenge is solved; run skills are locked."
-    : override
-    ? "This run has custom skills."
-    : "This run is inheriting the challenge defaults.";
-  renderSkillChecklist(
-    $("#run-skill-list"),
-    run.enabled_skills || currentChallengeDefaultSkills
-  );
-  if (challengeSolved) {
-    $("#run-skill-list").querySelectorAll(".skill-cb").forEach((cb) => {
-      cb.disabled = true;
-    });
-  }
-  $("#btn-run-skills-apply").disabled = challengeSolved;
-  $("#btn-run-skills-apply-all").disabled = challengeSolved;
-  $("#btn-run-skills-reset").disabled = challengeSolved || !override;
+    : "Inherit follows the challenge policy; Auto selects related skills for this run; Manual uses your exact list.";
+  bindSkillSelection($("#run-skill-list"), { skills_mode: run.skills_mode || (override ? "manual" : "inherit"), enabled_skills: run.enabled_skills ?? currentChallengeDefaultSkills });
+  const binding = skillBindings.get("run-skill-list");
+  binding.select.disabled = challengeSolved;
+  binding.details.querySelectorAll("button, .skill-cb").forEach(control => { control.disabled = challengeSolved; });
+  $('#btn-run-skills-apply').disabled = challengeSolved || catalogState !== 'ready';
+  $('#btn-run-skills-apply-all').disabled = challengeSolved || catalogState !== 'ready';
+  $('#btn-run-skills-reset').disabled = challengeSolved || !override || catalogState !== 'ready';
   $("#run-skill-overlay").classList.remove("hidden");
 }
 
@@ -3012,43 +3165,43 @@ function setRunSkillButtonsDisabled(disabled) {
 
 async function applyRunSkills(options = {}) {
   if (!currentChallengeId || !runSkillModalRunId) return;
+  if (catalogState !== 'ready') { showToast(gatewayStatus.error || 'Refresh 9router models before resuming with new skills.', 'error'); return; }
   const body = {
     resume: true,
     apply_to_all: !!options.applyToAll,
   };
-  if (options.reset) {
-    body.reset = true;
-  } else {
-    body.enabled_skills = getSelectedSkills($("#run-skill-list"));
-  }
+  const selection = options.reset ? { skills_mode: "inherit" } : skillSelectionPayload($("#run-skill-list"));
+  Object.assign(body, selection);
+  if (selection.skills_mode === "inherit") body.reset = true;
   setRunSkillButtonsDisabled(true);
-  const res = await api(
-    `/api/challenges/${currentChallengeId}/runs/${runSkillModalRunId}/skills`,
-    { method: "PUT", body: JSON.stringify(body) }
-  );
-  setRunSkillButtonsDisabled(false);
-  if (!res) return;
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.error) {
-    showToast(data.error || "Failed to update run skills", "error");
-    return;
-  }
-  for (const summary of data.runs || []) {
-    updateRunFromSummary(summary);
-  }
-  if (data.status) {
-    updateStatusBadge(data.status);
-    updateButtons(data.status);
-    if (data.status === "solving") startTimer();
-  }
-  closeRunSkillsModal();
-  const count = (data.runs || []).length;
-  showToast(
-    options.applyToAll
-      ? `Updated ${count} run${count === 1 ? "" : "s"}`
-      : "Run skills updated",
-    "success"
-  );
+  try {
+    const res = await api(
+      `/api/challenges/${currentChallengeId}/runs/${runSkillModalRunId}/skills`,
+      { method: "PUT", body: JSON.stringify(body) }
+    );
+    if (!res) return;
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) {
+      showToast(data.error || "Failed to update run skills", "error");
+      return;
+    }
+    for (const summary of data.runs || []) {
+      updateRunFromSummary(summary);
+    }
+    if (data.status) {
+      updateStatusBadge(data.status);
+      updateButtons(data.status);
+      if (data.status === "solving") startTimer();
+    }
+    closeRunSkillsModal();
+    const count = (data.runs || []).length;
+    showToast(
+      options.applyToAll
+        ? `Updated ${count} run${count === 1 ? "" : "s"}`
+        : "Run skills updated",
+      "success"
+    );
+  } finally { setRunSkillButtonsDisabled(false); }
 }
 
 function openRunGoalModal(runId) {
@@ -3760,15 +3913,28 @@ function renderRunEvent(runId, event) {
     return;
   }
 
+  if (event.type === "runtime_resources") {
+    const rid = event.run_id || runId;
+    const run = currentRuns.find(r => r.id === rid);
+    if (run && !suppressHistoricalStateUpdates) run.runtime_resources = event;
+    const skills = normalizeSkillNames(event.skills);
+    const servers = Array.isArray(event.mcp_servers) ? event.mcp_servers : (event.mcp || []);
+    const statuses = servers.map(server => server.name + ": " + (server.status || "unknown")).join(" · ");
+    appendMsg(feed, "Native resources · " + skills.length + " workspace skills" + (statuses ? " · MCP " + statuses : " · MCP connection not reported"), "runtime-resources-msg", event.ts);
+    scrollBottomIfActive(runId);
+    return;
+  }
+
   if (event.type === "run_skills") {
     const rid = event.run_id || runId;
     const run = currentRuns.find((r) => r.id === rid);
-    if (run) {
-      run.enabled_skills = normalizeSkillNames(event.enabled_skills || []);
-      run.skill_override = !!event.skill_override;
+    if (run && !suppressHistoricalStateUpdates) {
+      if (Object.hasOwn(event, "enabled_skills")) run.enabled_skills = normalizeSkillNames(event.enabled_skills);
+      if (Object.hasOwn(event, "skills_mode")) run.skills_mode = event.skills_mode;
+      if (Object.hasOwn(event, "skill_override")) run.skill_override = !!event.skill_override;
     }
-    const count = normalizeSkillNames(event.enabled_skills || []).length;
-    const mode = event.skill_override ? "custom" : "default";
+    const count = normalizeSkillNames(event.enabled_skills).length;
+    const mode = event.skills_mode || (event.skill_override ? "manual" : "inherit");
     appendMsg(
       feed,
       `${event.message || "Run skills updated."} ${count} ${mode} skill${count === 1 ? "" : "s"} enabled.`,
@@ -4721,8 +4887,8 @@ function switchTab(tabId) {
 
 // === Advisor ===
 let advisorWs = null;
-let advisorAgents = [];
 let advisorStarted = false;
+let advisorThinking = false;
 
 function disconnectAdvisorWS() {
   if (advisorWs) {
@@ -4733,9 +4899,9 @@ function disconnectAdvisorWS() {
 }
 
 function setAdvisorStatus(status) {
-  const btn = $("#advisor-send");
   const thinking = status === "thinking";
-  if (btn) btn.disabled = thinking;
+  advisorThinking = thinking;
+  renderGatewayStatus();
   let ind = $("#advisor-thinking");
   if (thinking && !ind) {
     ind = document.createElement("div");
@@ -4749,23 +4915,19 @@ function setAdvisorStatus(status) {
   }
 }
 
-function populateAdvisorModels(agentName, selectedModel) {
-  const agent = advisorAgents.find((a) => a.name === agentName);
-  const sel = $("#advisor-model");
-  const models = (agent && agent.models) || [];
-  sel.innerHTML = models.map((m) =>
-    `<option value="${esc(m.value)}" ${m.value === selectedModel ? "selected" : ""}>${esc(m.label)}</option>`
-  ).join("") || `<option value="">default</option>`;
+function populateAdvisorModels(agentName, selection = agentPreset(agentName)) {
+  const model = $('#advisor-model');
+  const effort = $('#advisor-effort');
+  const controls = bindModelEffortControls(agentName, model, effort, selection);
+  controls.lock(advisorStarted);
 }
 
 function populateAdvisorConfig(cfg) {
-  const agentSel = $("#advisor-agent");
-  agentSel.innerHTML = advisorAgents.map((a) =>
-    `<option value="${esc(a.name)}" ${a.name === cfg.agent ? "selected" : ""}>${esc(a.label)}</option>`
-  ).join("");
-  populateAdvisorModels(cfg.agent || (advisorAgents[0] && advisorAgents[0].name), cfg.model);
+  const agentSel = $('#advisor-agent');
+  renderAgentSelect(agentSel);
+  agentSel.value = cfg.agent || defaultAgent || primaryAgentName();
+  populateAdvisorModels(agentSel.value, { ...agentPreset(agentSel.value), ...cfg, preserve: advisorStarted });
   agentSel.disabled = advisorStarted;
-  $("#advisor-model").disabled = advisorStarted;
 }
 
 function advisorAppendUser(text) {
@@ -4836,7 +4998,13 @@ function connectAdvisorWS() {
     if (ev.type === "advisor_user") advisorAppendUser(ev.text || "");
     else if (ev.type === "advisor_event") renderAdvisorEvent(ev.event);
     else if (ev.type === "advisor_status") setAdvisorStatus(ev.status);
-    else if (ev.type === "advisor_reset") { $("#advisor-log").innerHTML = ""; }
+    else if (ev.type === 'advisor_reset') {
+      advisorStarted = false;
+      $('#advisor-log').innerHTML = '';
+      $('#advisor-agent').disabled = false;
+      $('#advisor-model')._gatewayControls?.lock(false);
+      setAdvisorStatus('idle');
+    }
   };
   advisorWs.onclose = () => { advisorWs = null; };
 }
@@ -4844,9 +5012,12 @@ function connectAdvisorWS() {
 async function loadAdvisor() {
   if (!currentChallengeId) return;
   const res = await api(`/api/challenges/${currentChallengeId}/advisor`);
-  if (!res || !res.ok) return;
+  if (!res || !res.ok) {
+    const error = res ? await res.json().catch(() => ({})) : {};
+    showToast(error.error || 'Unable to load advisor configuration', 'error');
+    return;
+  }
   const data = await res.json();
-  advisorAgents = data.agents || [];
   advisorStarted = !!data.started;
   populateAdvisorConfig(data.config || {});
   renderAdvisorHistory(data.messages || []);
@@ -4854,47 +5025,46 @@ async function loadAdvisor() {
   connectAdvisorWS();
 }
 
-document.addEventListener("DOMContentLoaded", () => {
-  const agentSel = $("#advisor-agent");
-  if (agentSel) {
-    agentSel.addEventListener("change", () => populateAdvisorModels(agentSel.value, ""));
-  }
-  const form = $("#advisor-form");
-  if (form) {
-    form.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const input = $("#advisor-input");
-      const msg = input.value.trim();
-      if (!msg || !currentChallengeId) return;
-      const body = { message: msg };
-      if (!advisorStarted) {
-        body.agent = $("#advisor-agent").value;
-        body.model = $("#advisor-model").value;
-      }
-      input.value = "";
-      const res = await api(`/api/challenges/${currentChallengeId}/advisor`, {
-        method: "POST", body: JSON.stringify(body),
-      });
-      const data = res ? await res.json() : null;
-      if (!res || !res.ok) { showToast((data && data.error) || "Advisor error", "error"); return; }
+document.addEventListener('DOMContentLoaded', () => {
+  $('#advisor-agent').addEventListener('change', () => populateAdvisorModels($('#advisor-agent').value));
+  $('#advisor-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const input = $('#advisor-input');
+    const msg = input.value.trim();
+    if (!msg || !currentChallengeId || catalogState !== 'ready') return;
+    const body = { message: msg };
+    if (!advisorStarted) {
+      if ($('#advisor-model').dataset.unavailable === 'true') { showToast('Select an available 9router model', 'error'); return; }
+      body.agent = $('#advisor-agent').value;
+      body.model = $('#advisor-model').value;
+      body.effort = $('#advisor-effort').value;
+    }
+    const btn = $('#advisor-send');
+    btn.dataset.busy = 'true';
+    btn.disabled = true;
+    try {
+      const res = await api('/api/challenges/' + currentChallengeId + '/advisor', { method: 'POST', body: JSON.stringify(body) });
+      if (!res || !res.ok) return;
+      input.value = '';
       advisorStarted = true;
-      $("#advisor-agent").disabled = true;
-      $("#advisor-model").disabled = true;
-    });
-  }
-  const resetBtn = $("#btn-advisor-reset");
-  if (resetBtn) {
-    resetBtn.addEventListener("click", async () => {
-      if (!currentChallengeId) return;
-      const res = await api(`/api/challenges/${currentChallengeId}/advisor/reset`, { method: "POST" });
-      const data = res ? await res.json() : null;
-      if (!res || !res.ok) { showToast((data && data.error) || "Reset failed", "error"); return; }
+      $('#advisor-agent').disabled = true;
+      $('#advisor-model')._gatewayControls.lock(true);
+    } finally { delete btn.dataset.busy; renderGatewayStatus(); }
+  });
+  $('#btn-advisor-reset').addEventListener('click', async () => {
+    if (!currentChallengeId) return;
+    const btn = $('#btn-advisor-reset');
+    btn.disabled = true;
+    try {
+      const res = await api('/api/challenges/' + currentChallengeId + '/advisor/reset', { method: 'POST' });
+      if (!res || !res.ok) return;
       advisorStarted = false;
-      $("#advisor-log").innerHTML = "";
-      $("#advisor-agent").disabled = false;
-      $("#advisor-model").disabled = false;
-    });
-  }
+      $('#advisor-log').innerHTML = '';
+      $('#advisor-agent').disabled = false;
+      $('#advisor-model')._gatewayControls?.lock(false);
+      setAdvisorStatus('idle');
+    } finally { btn.disabled = false; }
+  });
 });
 
 // === Files Browser ===
@@ -5270,44 +5440,20 @@ $("#btn-sidebar-toggle").addEventListener("click", () => {
 // === Steer ===
 async function sendSteerToRun(runId, inputEl) {
   const msg = inputEl.value.trim();
-  if (!msg || !currentChallengeId) return;
-  inputEl.value = "";
-  const res = await api(`/api/challenges/${currentChallengeId}/steer`, {
-    method: "POST",
-    body: JSON.stringify({ message: msg, run_id: runId }),
+  if (!msg || !currentChallengeId || catalogState !== 'ready') return;
+  const button = inputEl.parentElement.querySelector('.split-steer-btn') || $('#btn-steer');
+  await withBusy(button, async () => {
+    const res = await api('/api/challenges/' + currentChallengeId + '/steer', { method: 'POST', body: JSON.stringify({ message: msg, ...(runId ? { run_id: runId } : {}) }) });
+    if (!res || !res.ok) return;
+    inputEl.value = '';
+    markRunsSolving(runId || '');
+    updateStatusBadge('solving'); updateButtons('solving'); startTimer();
+    $('#error-banner').classList.add('hidden');
   });
-  if (res && res.ok) {
-    markRunsSolving(runId);
-    updateStatusBadge("solving");
-    updateButtons("solving");
-    startTimer();
-    $("#error-banner").classList.add("hidden");
-  }
 }
 
 async function sendSteer() {
-  const input = $("#steer-input");
-  const msg = input.value.trim();
-  if (!msg || !currentChallengeId) return;
-  input.value = "";
-
-  const body = { message: msg };
-  // Send to whichever run tab is currently active
-  if (activeRunId && activeRunId !== "__default__") {
-    body.run_id = activeRunId;
-  }
-
-  const res = await api(`/api/challenges/${currentChallengeId}/steer`, {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
-  if (res && res.ok) {
-    markRunsSolving(body.run_id || "");
-    updateStatusBadge("solving");
-    updateButtons("solving");
-    startTimer();
-    $("#error-banner").classList.add("hidden");
-  }
+  await sendSteerToRun(activeRunId && activeRunId !== '__default__' ? activeRunId : '', $('#steer-input'));
 }
 
 $("#btn-steer").addEventListener("click", sendSteer);
@@ -5338,11 +5484,7 @@ $("#btn-add-run-reset-prompt").addEventListener("click", () => {
   addRunPromptDirty = false;
   refreshAddRunPromptTemplate();
 });
-$("#add-run-skill-list").addEventListener("change", (e) => {
-  if (e.target.classList.contains("skill-cb") && !addRunPromptDirty) {
-    refreshAddRunPromptTemplate({ preserveDirty: true, silent: true });
-  }
-});
+
 $("#btn-add-run-agent-row").addEventListener("click", () => {
   addAgentRow($("#add-run-agent-list"));
 });
@@ -5395,315 +5537,40 @@ $("#btn-usage-back").addEventListener("click", () => {
   showView("dashboard");
   loadChallenges();
 });
-$("#btn-usage-refresh").addEventListener("click", loadUsage);
+$('#btn-usage-refresh').addEventListener('click', e => withBusy(e.currentTarget, async () => { await loadAgentCatalog(true); await loadUsage(); }));
 
 async function loadUsage() {
-  const [usageRes, authRes] = await Promise.all([
-    api("/api/usage"),
-    api("/api/agents/auth/status"),
-  ]);
-  if (!usageRes) return;
-  const data = await usageRes.json();
-  if (authRes) {
-    const authData = await authRes.json();
-    agentAuthStatus = authData.agents || {};
-  }
-  renderUsage(data);
+  const btn = $('#btn-usage-refresh');
+  btn.disabled = true;
+  try {
+    const res = await api('/api/usage');
+    if (!res || !res.ok) return;
+    renderUsage(await res.json());
+  } finally { btn.disabled = false; }
 }
 
 function renderUsage(data) {
-  const usage = data.agents || {};
-  const cs = data.challenges || {};
-
-  agentCatalog.forEach((agent) => {
-    const badge = $(`#${agent.name}-auth-badge`);
-    const info = $(`#${agent.name}-auth-info`);
-    const stats = $(`#${agent.name}-stats`);
-    const challengeStats = $(`#${agent.name}-challenge-stats`);
-    const entry = usage[agent.name];
-    const auth = agentAuthStatus[agent.name] || {};
-    const connected = !!entry || !!auth.connected;
-
-    if (connected) {
-      badge.textContent = "connected";
-      badge.className = "badge badge-solved";
-    } else if (auth.available === false) {
-      badge.textContent = "not installed";
-      badge.className = "badge badge-failed";
-    } else {
-      badge.textContent = "not connected";
-      badge.className = "badge badge-pending";
-    }
-
-    if (entry) {
-      info.innerHTML = (entry.auth_rows || [])
-        .map((row) => kvRow(row.label, row.value))
-        .join("") + renderAuthActions(agent, connected, auth);
-      stats.innerHTML = (entry.stat_rows || [])
-        .map((row) => kvRow(row.label, row.value, row.bar))
-        .join("");
-    } else if (connected) {
-      info.innerHTML = (auth.rows || [])
-        .map((row) => kvRow(row.label, row.value))
-        .join("") + renderAuthActions(agent, connected, auth);
-      stats.innerHTML = "";
-    } else {
-      const detail = auth.error
-        ? `<span class="text-muted">${esc(auth.error)}</span>`
-        : `<span class="text-muted">Run <code>${esc(agent.auth_connect_command)}</code> to connect</span>`;
-      info.innerHTML = detail + renderAuthActions(agent, connected, auth);
-      stats.innerHTML = "";
-    }
-
-    challengeStats.innerHTML = renderChallengeStats(cs[agent.name]);
+  if (data.gateway && (catalogState === 'ready' || data.gateway.status !== 'ready')) {
+    gatewayStatus = data.gateway;
+    if (gatewayStatus.status !== 'ready') catalogState = gatewayStatus.status;
+    document.querySelectorAll('select').forEach(sel => sel._gatewayControls?.refresh());
+  }
+  renderGatewayStatus();
+  agentCatalog.forEach(agent => {
+    const card = document.getElementById('usage-' + agent.name);
+    if (!card) return;
+    const entry = data.agents?.[agent.name] || gatewayStatus.harnesses?.[agent.name] || {};
+    const badge = card.querySelector('[data-harness-status]');
+    badge.textContent = entry.ready ? 'Catalog ready' : entry.available ? 'Not ready' : 'Unavailable';
+    badge.className = 'badge ' + (entry.ready ? 'badge-solved' : 'badge-failed');
+    card.querySelector('[data-harness-error]').textContent = entry.error || 'Native harness available; catalog readiness does not verify inference or quota.';
+    card.querySelector('[data-challenge-stats]').innerHTML = renderChallengeStats(data.challenges?.[agent.name]);
   });
-  document.querySelectorAll(".agent-auth-start").forEach((btn) => {
-    btn.addEventListener("click", () => startAgentAuth(btn.dataset.agent || ""));
-  });
-  document.querySelectorAll(".agent-env-auth-save").forEach((btn) => {
-    btn.addEventListener("click", () => saveAgentEnvAuth(btn.dataset.agent || ""));
-  });
-  document.querySelectorAll(".agent-env-auth-clear").forEach((btn) => {
-    btn.addEventListener("click", () => clearAgentEnvAuth(btn.dataset.agent || ""));
-  });
-
-  const dailySection = $("#usage-daily");
-  const dailyEntry = agentCatalog
-    .map((agent) => ({ agent, usage: usage[agent.name] }))
-    .find(({ usage: entry }) => entry && entry.daily_activity && entry.daily_activity.length);
-  if (dailyEntry) {
-    dailySection.classList.remove("hidden");
-    $("#usage-daily-title").textContent = dailyEntry.usage.daily_activity_title || `Daily Activity (${dailyEntry.agent.label})`;
-    renderDailyChart(dailyEntry.usage.daily_activity);
-  } else {
-    dailySection.classList.add("hidden");
-  }
 }
 
-function renderAuthActions(agent, connected, auth) {
-  const disabled = auth.available === false ? "disabled" : "";
-  const label = connected ? "Reconnect" : "Login";
-  const command = auth.command || agent.auth_connect_command || "";
-  return `<div class="usage-auth-actions">
-    <button type="button" class="btn-ghost btn-sm agent-auth-start" data-agent="${esc(agent.name)}" ${disabled}>${label}</button>
-    ${command ? `<span class="text-muted"><code>${esc(command)}</code></span>` : ""}
-  </div>${agent.name === "claude" ? renderClaudeEnvAuth(auth) : ""}`;
-}
 
-function renderClaudeEnvAuth(auth) {
-  const envAuth = auth.env_auth || {};
-  const configured = !!envAuth.configured;
-  const baseUrl = envAuth.base_url || "";
-  const source = envAuth.source === "process" ? "process env" : "saved env";
-  const status = configured
-    ? `ANTHROPIC_AUTH_TOKEN configured from ${source}`
-    : "No ANTHROPIC_AUTH_TOKEN configured";
-  const clearDisabled = envAuth.saved ? "" : "disabled";
-  return `<div class="usage-env-auth" data-agent="claude">
-    <div class="usage-env-auth-title">Environment Login</div>
-    <label class="usage-env-auth-field">
-      <span>ANTHROPIC_BASE_URL</span>
-      <input type="url" class="agent-env-base-url" value="${esc(baseUrl)}" placeholder="https://api.anthropic.com">
-    </label>
-    <label class="usage-env-auth-field">
-      <span>ANTHROPIC_AUTH_TOKEN</span>
-      <input type="password" class="agent-env-auth-token" autocomplete="off" placeholder="${configured ? "Configured; leave blank to keep" : "Token"}">
-    </label>
-    <div class="usage-env-auth-actions">
-      <button type="button" class="btn-ghost btn-sm agent-env-auth-save" data-agent="claude">Save Env Login</button>
-      <button type="button" class="btn-ghost btn-sm agent-env-auth-clear" data-agent="claude" ${clearDisabled}>Clear</button>
-      <span class="text-muted">${esc(status)}</span>
-    </div>
-  </div>`;
-}
-
-async function saveAgentEnvAuth(agentName) {
-  if (agentName !== "claude") return;
-  const form = document.querySelector(`.usage-env-auth[data-agent="${agentName}"]`);
-  if (!form) return;
-  const baseUrl = form.querySelector(".agent-env-base-url")?.value.trim() || "";
-  const authToken = form.querySelector(".agent-env-auth-token")?.value.trim() || "";
-  const res = await api("/api/agents/auth/env", {
-    method: "POST",
-    body: JSON.stringify({
-      agent: agentName,
-      base_url: baseUrl,
-      auth_token: authToken,
-    }),
-  });
-  if (!res) return;
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.error) {
-    showToast(data.error || "Failed to save Claude env login", "error");
-    return;
-  }
-  showToast("Claude env login saved", "success");
-  await loadUsage();
-}
-
-async function clearAgentEnvAuth(agentName) {
-  if (agentName !== "claude") return;
-  const res = await api("/api/agents/auth/env", {
-    method: "POST",
-    body: JSON.stringify({ agent: agentName, clear: true }),
-  });
-  if (!res) return;
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.error) {
-    showToast(data.error || "Failed to clear Claude env login", "error");
-    return;
-  }
-  showToast("Claude env login cleared", "success");
-  await loadUsage();
-}
-
-function setAgentAuthTerminal(agent, command) {
-  const terminal = $("#agent-auth-terminal");
-  terminal.classList.remove("hidden");
-  $("#agent-auth-title").textContent = `${agent.label || agent.name} Login`;
-  $("#agent-auth-subtitle").textContent = command || "";
-  agentAuthOutputText = "";
-  $("#agent-auth-output").innerHTML = "";
-  $("#agent-auth-input").value = "";
-  $("#agent-auth-input").focus();
-}
-
-function stripAnsiSequences(text) {
-  return String(text || "")
-    .replace(
-      /\x1b\]8;;(https?:\/\/[^\x07\x1b]+)(?:\x07|\x1b\\)(.*?)\x1b\]8;;(?:\x07|\x1b\\)/gis,
-      (_match, url, label) => label && label !== url ? `${label} (${url})` : url,
-    )
-    .replace(
-      /\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[PX^_][\s\S]*?\x1b\\)/g,
-      "",
-    )
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n");
-}
-
-function linkifyPlainText(text) {
-  const urlRe = /https?:\/\/[^\s<>"'`]+/g;
-  let html = "";
-  let lastIndex = 0;
-  for (const match of text.matchAll(urlRe)) {
-    const rawUrl = match[0];
-    const start = match.index || 0;
-    html += esc(text.slice(lastIndex, start));
-
-    const trailing = rawUrl.match(/[)\].,;:!?]+$/)?.[0] || "";
-    const url = trailing ? rawUrl.slice(0, -trailing.length) : rawUrl;
-    if (url) {
-      html += `<a href="${esc(url)}" target="_blank" rel="noreferrer noopener">${esc(url)}</a>`;
-    }
-    if (trailing) html += esc(trailing);
-    lastIndex = start + rawUrl.length;
-  }
-  html += esc(text.slice(lastIndex));
-  return html;
-}
-
-function appendAgentAuthOutput(text) {
-  const output = $("#agent-auth-output");
-  agentAuthOutputText += stripAnsiSequences(text);
-  if (agentAuthOutputText.length > 120000) {
-    agentAuthOutputText = agentAuthOutputText.slice(-100000);
-  }
-  output.innerHTML = linkifyPlainText(agentAuthOutputText);
-  output.scrollTop = output.scrollHeight;
-}
-
-function closeAgentAuthWs(cancel = false) {
-  if (!agentAuthWs) return;
-  if (cancel && agentAuthWs.readyState === WebSocket.OPEN) {
-    agentAuthWs.send(JSON.stringify({ type: "cancel" }));
-  }
-  agentAuthWs.close();
-  agentAuthWs = null;
-  activeAgentAuthSession = null;
-}
-
-async function startAgentAuth(agentName) {
-  const agent = getAgentMeta(agentName);
-  if (!agent?.name) return;
-  closeAgentAuthWs(true);
-  const res = await api("/api/agents/auth/start", {
-    method: "POST",
-    body: JSON.stringify({ agent: agent.name }),
-  });
-  if (!res) return;
-  const data = await res.json();
-  if (!res.ok) {
-    showToast(data.error || "Could not start login", "error");
-    return;
-  }
-
-  activeAgentAuthSession = data.session_id;
-  setAgentAuthTerminal(agent, data.command || agent.auth_connect_command || "");
-  appendAgentAuthOutput(`Starting ${data.command}\n\n`);
-
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(
-    `${proto}://${location.host}/ws/agents/auth/${encodeURIComponent(data.session_id)}`
-  );
-  agentAuthWs = ws;
-
-  ws.onmessage = async (event) => {
-    let msg;
-    try {
-      msg = JSON.parse(event.data);
-    } catch {
-      return;
-    }
-    if (msg.type === "output") {
-      appendAgentAuthOutput(msg.data || "");
-    } else if (msg.type === "start") {
-      $("#agent-auth-subtitle").textContent = msg.command || "";
-    } else if (msg.type === "exit") {
-      const status = msg.cancelled
-        ? "cancelled"
-        : Number(msg.returncode) === 0 ? "completed" : `exited ${msg.returncode}`;
-      appendAgentAuthOutput(`\n[login ${status}]\n`);
-      agentAuthWs = null;
-      activeAgentAuthSession = null;
-      await loadUsage();
-    } else if (msg.type === "error") {
-      appendAgentAuthOutput(`\n[error] ${msg.message || "Login failed"}\n`);
-    }
-  };
-  ws.onclose = () => {
-    if (agentAuthWs === ws) {
-      agentAuthWs = null;
-      activeAgentAuthSession = null;
-    }
-  };
-  ws.onerror = () => {
-    appendAgentAuthOutput("\n[connection error]\n");
-  };
-}
-
-$("#agent-auth-input-form").addEventListener("submit", (event) => {
-  event.preventDefault();
-  const input = $("#agent-auth-input");
-  if (!agentAuthWs || agentAuthWs.readyState !== WebSocket.OPEN) return;
-  agentAuthWs.send(JSON.stringify({ type: "input", data: `${input.value}\n` }));
-  input.value = "";
-});
-
-$("#btn-agent-auth-cancel").addEventListener("click", () => {
-  closeAgentAuthWs(true);
-  appendAgentAuthOutput("\n[cancel requested]\n");
-});
-
-function kvRow(key, value, bar) {
-  let html = `<span class="usage-kv"><span class="usage-k">${esc(String(key))}</span> ${esc(String(value))}`;
-  if (bar !== undefined && bar !== null) {
-    const pct = Math.min(Math.max(Number(bar), 0), 100);
-    const cls = pct >= 90 ? "bar-danger" : pct >= 70 ? "bar-warn" : "bar-ok";
-    html += `<span class="usage-bar"><span class="usage-bar-fill ${cls}" style="width:${pct}%"></span></span>`;
-  }
-  html += `</span>`;
-  return html;
+function kvRow(key, value) {
+  return '<span class="usage-kv"><span class="usage-k">' + esc(String(key)) + '</span> ' + esc(String(value)) + '</span>';
 }
 
 function renderChallengeStats(stats) {
@@ -5718,19 +5585,6 @@ function renderChallengeStats(stats) {
   ].join("");
 }
 
-function renderDailyChart(activity) {
-  const chart = $("#daily-chart");
-  const maxMsg = Math.max(...activity.map((d) => d.messageCount), 1);
-  chart.innerHTML = activity.map((d) => {
-    const pct = Math.round((d.messageCount / maxMsg) * 100);
-    const label = d.date.slice(5); // MM-DD
-    return `<div class="daily-bar-wrap" title="${d.date}: ${d.messageCount} messages, ${d.sessionCount} sessions, ${d.toolCallCount} tools">
-      <div class="daily-bar" style="height:${Math.max(pct, 4)}%"></div>
-      <span class="daily-label">${label}</span>
-      <span class="daily-value">${d.messageCount}</span>
-    </div>`;
-  }).join("");
-}
 
 // === Import from Platform ===
 let importPlugins = [];
@@ -5855,7 +5709,7 @@ $("#btn-import").addEventListener("click", async () => {
   $("#import-status").classList.add("hidden");
   // Set up preview controls using saved agent settings
   populateAgentList($("#import-agent-list"));
-  renderSkillChecklist($("#import-skill-list"), defaultEnabledSkills);
+  bindSkillSelection($("#import-skill-list"), { skills_mode: defaultSkillsMode, enabled_skills: defaultEnabledSkills });
   $("#import-flag").value = defaultFlagFormat;
   $("#import-overlay").classList.remove("hidden");
 });
@@ -6037,12 +5891,13 @@ $("#btn-import-submit").addEventListener("click", async () => {
       files: ch.files,
     };
     if (importChallengeSkillOverrides.has(idx)) {
-      cfg.enabled_skills = importChallengeSkillOverrides.get(idx);
+      Object.assign(cfg, importChallengeSkillOverrides.get(idx));
     }
     return cfg;
   });
 
   const btn = $("#btn-import-submit");
+  btn.dataset.busy = 'true';
   btn.disabled = true;
   btn.textContent = "Importing...";
   const progressId = makeClientId("platform-import");
@@ -6059,6 +5914,7 @@ $("#btn-import-submit").addEventListener("click", async () => {
 
   try {
     const agentRows = getAgentRows($("#import-agent-list"));
+    if (!agentRows) { importPhase('preview'); return; }
     const mode = agentRows.length > 1 ? "parallel" : "single";
     const res = await api("/api/plugins/import", {
       method: "POST",
@@ -6068,9 +5924,7 @@ $("#btn-import-submit").addEventListener("click", async () => {
         challenges: selected,
         mode: mode,
         agents: JSON.stringify(agentRows),
-        enabled_skills: getSelectedSkills($("#import-skill-list")),
-        model: "",
-        effort: "",
+        ...skillSelectionPayload($("#import-skill-list")),
         flag_format: $("#import-flag").value.trim(),
         paused: $("#import-paused").checked,
         progress_id: progressId,
@@ -6115,7 +5969,8 @@ $("#btn-import-submit").addEventListener("click", async () => {
     loadChallenges();
   } finally {
     stopImportProgressPolling();
-    btn.disabled = false;
+    delete btn.dataset.busy;
+    renderGatewayStatus();
     btn.textContent = "Import Selected";
   }
 });
@@ -6166,9 +6021,9 @@ function updateSettingsVpnStatus(data) {
 }
 
 $("#btn-settings").addEventListener("click", async () => {
-  await loadSkillCatalog();
+  await Promise.all([loadSkillCatalog(), loadResources()]);
   const res = await api("/api/settings");
-  if (!res) return;
+  if (!res || !res.ok) { showToast('Unable to load Settings', 'error'); return; }
   const s = await res.json();
 
   // General
@@ -6179,32 +6034,32 @@ $("#btn-settings").addEventListener("click", async () => {
   $("#settings-auto-submit").checked = !!s.auto_submit_flags;
 
   // Agents
-  const agentList = $("#settings-agent-list");
-  const savedEnabled = s.enabled_agents && s.enabled_agents.length ? s.enabled_agents : [defaultAgent];
+  const agentList = $('#settings-agent-list');
+  const savedEnabled = s.enabled_agents?.length ? s.enabled_agents : [defaultAgent];
   const savedModels = s.agent_models || {};
   const savedEfforts = s.agent_efforts || {};
-  agentList.innerHTML = agentCatalog.map((agent) => {
-    const checked = savedEnabled.includes(agent.name) ? "checked" : "";
-    const modelOptions = (agent.models || []).map((m) =>
-      `<option value="${esc(m.value)}" ${savedModels[agent.name] === m.value ? "selected" : ""}>${esc(m.label)}</option>`
-    ).join("");
-    const efforts = agent.effort_levels || [];
-    const effortHtml = efforts.length
-      ? `<select class="settings-agent-effort" data-agent="${esc(agent.name)}">${efforts.map((e) =>
-          `<option value="${esc(e.value)}" ${savedEfforts[agent.name] === e.value ? "selected" : ""}>${esc(e.label)}</option>`
-        ).join("")}</select>`
-      : "";
-    return `<div class="settings-agent-row">
-      <label class="checkbox-label">
-        <input type="checkbox" class="settings-agent-cb" value="${esc(agent.name)}" ${checked}>
-        <span>${esc(agent.label)}</span>
-      </label>
-      <select class="settings-agent-model" data-agent="${esc(agent.name)}">${modelOptions}</select>
-      ${effortHtml}
-    </div>`;
-  }).join("");
+  settingsAgentDirty.clear();
+  settingsEnabledDirty = false;
+  settingsOriginalModels = { ...savedModels };
+  settingsOriginalEfforts = { ...savedEfforts };
+  agentList.innerHTML = '';
+  for (const agent of agentCatalog) {
+    const row = document.createElement('div');
+    row.className = 'settings-agent-row';
+    row.innerHTML = '<label class="checkbox-label"><input type="checkbox" class="settings-agent-cb" value="' + esc(agent.name) + '" ' + (savedEnabled.includes(agent.name) ? 'checked' : '') + '><span>' + esc(agent.label) + '</span></label><select class="settings-agent-model" data-agent="' + esc(agent.name) + '"></select><select class="settings-agent-effort" data-agent="' + esc(agent.name) + '"></select>';
+    agentList.appendChild(row);
+    const preset = agentPreset(agent.name);
+    bindModelEffortControls(agent.name, row.querySelector('.settings-agent-model'), row.querySelector('.settings-agent-effort'), {
+      model: Object.hasOwn(savedModels, agent.name) ? savedModels[agent.name] : preset.model,
+      effort: Object.hasOwn(savedEfforts, agent.name) ? savedEfforts[agent.name] : preset.effort,
+    });
+    row.addEventListener('change', e => {
+      if (e.target.classList.contains('settings-agent-cb')) settingsEnabledDirty = true;
+      else settingsAgentDirty.add(agent.name);
+    });
+  }
 
-  renderSkillChecklist($("#settings-skill-list"), s.enabled_skills || defaultEnabledSkills);
+  bindSkillSelection($("#settings-skill-list"), { skills_mode: skillsMode(s), enabled_skills: s.enabled_skills ?? defaultEnabledSkills });
   $("#settings-skill-upload").value = "";
   $("#settings-skill-upload-result").textContent = "";
   $("#settings-hook-rtk").checked = new Set(s.enabled_hooks || []).has("rtk");
@@ -6473,13 +6328,14 @@ $("#btn-settings-skill-upload").addEventListener("click", uploadSettingsSkill);
 
 $("#btn-settings-save").addEventListener("click", async () => {
   const selectedAgents = Array.from(document.querySelectorAll(".settings-agent-cb:checked")).map((cb) => cb.value);
-  const models = {};
+  if (!selectedAgents.length) { showToast('At least one agent is required', 'error'); return; }
+  const models = { ...settingsOriginalModels };
   document.querySelectorAll(".settings-agent-model").forEach((sel) => {
-    if (sel.value) models[sel.dataset.agent] = sel.value;
+    if (selectedAgents.includes(sel.dataset.agent) || settingsAgentDirty.has(sel.dataset.agent)) models[sel.dataset.agent] = sel.value;
   });
-  const efforts = {};
+  const efforts = { ...settingsOriginalEfforts };
   document.querySelectorAll(".settings-agent-effort").forEach((sel) => {
-    if (sel.value) efforts[sel.dataset.agent] = sel.value;
+    if (selectedAgents.includes(sel.dataset.agent) || settingsAgentDirty.has(sel.dataset.agent)) efforts[sel.dataset.agent] = sel.value;
   });
 
   const body = {
@@ -6491,7 +6347,7 @@ $("#btn-settings-save").addEventListener("click", async () => {
     enabled_agents: selectedAgents,
     agent_models: models,
     agent_efforts: efforts,
-    enabled_skills: getSelectedSkills($("#settings-skill-list")),
+    ...skillSelectionPayload($("#settings-skill-list")),
     enabled_hooks: $("#settings-hook-rtk").checked ? ["rtk"] : [],
     default_agent: selectedAgents[0] || defaultAgent,
     discord_enabled: $("#settings-discord-enabled").checked,
@@ -6499,21 +6355,37 @@ $("#btn-settings-save").addEventListener("click", async () => {
     discord_channel_id: $("#settings-discord-channel").value.trim(),
     discord_challenge_layout: $("#settings-discord-layout").value,
   };
-  const res = await api("/api/settings", { method: "PUT", body: JSON.stringify(body) });
-  if (res && res.ok) {
-    const saved = await res.json();
-    defaultFlagFormat = saved.default_flag_format || "";
-    currentTheme = saved.theme || "dark";
-    chatViewMode = saved.chat_view_mode || "split";
-    enabledAgents = saved.enabled_agents && saved.enabled_agents.length
-      ? saved.enabled_agents : [defaultAgent];
-    agentModels = saved.agent_models || {};
-    agentEfforts = saved.agent_efforts || {};
-    defaultEnabledSkills = normalizeSkillNames(saved.enabled_skills || allSkillNames());
-    defaultAgent = saved.default_agent || enabledAgents[0];
-    applyTheme(currentTheme);
-    showToast("Settings saved", "success");
+  if (!settingsEnabledDirty && !settingsAgentDirty.size) {
+    delete body.enabled_agents; delete body.agent_models; delete body.agent_efforts; delete body.default_agent;
   }
+  else {
+    const invalid = selectedAgents.some(name => {
+      const row = Array.from(document.querySelectorAll('.settings-agent-row')).find(el => el.querySelector('.settings-agent-cb').value === name);
+      return !row || row.querySelector('.settings-agent-model').dataset.unavailable === 'true' || gatewayStatus.harnesses?.[name]?.ready === false;
+    });
+    if (catalogState !== 'ready' || invalid) { showToast(gatewayStatus.error || 'Select an available 9router model and harness before saving presets.', 'error'); return; }
+  }
+  await withBusy($('#btn-settings-save'), async () => {
+    const res = await api("/api/settings", { method: "PUT", body: JSON.stringify(body) });
+    if (res && res.ok) {
+      const saved = await res.json();
+      defaultFlagFormat = saved.default_flag_format || "";
+      currentTheme = saved.theme || "dark";
+      chatViewMode = saved.chat_view_mode || "split";
+      enabledAgents = saved.enabled_agents && saved.enabled_agents.length
+        ? saved.enabled_agents : [defaultAgent];
+      agentModels = saved.agent_models || {};
+      agentEfforts = saved.agent_efforts || {};
+      defaultEnabledSkills = normalizeSkillNames(saved.enabled_skills ?? []);
+      defaultSkillsMode = skillsMode(saved);
+      bindSkillSelection($("#settings-skill-list"), saved);
+      defaultAgent = saved.default_agent || enabledAgents[0];
+      settingsAgentDirty.clear(); settingsEnabledDirty = false;
+      settingsOriginalModels = { ...agentModels }; settingsOriginalEfforts = { ...agentEfforts };
+      applyTheme(currentTheme);
+      showToast("Settings saved", "success");
+    }
+  });
 });
 
 // Discord channel fetch
@@ -6631,8 +6503,7 @@ async function handleDeepLink() {
   }
 }
 
-window.addEventListener("hashchange", () => {
-  if (!csrfToken) return; // not logged in
+function handleHashChange() {
   const challengeId = getDeepLinkChallengeId();
   if (challengeId && challengeId !== currentChallengeId) {
     openChallenge(challengeId);
@@ -6640,24 +6511,34 @@ window.addEventListener("hashchange", () => {
     disconnectAllWS(); stopTimer(); currentChallengeId = null;
     showView("dashboard"); loadChallenges();
   }
+}
+
+window.addEventListener("pagehide", () => {
+  appAlive = false;
+  disconnectGlobalWS();
+});
+
+window.addEventListener("pageshow", (event) => {
+  if (!event.persisted) return;
+  appAlive = true;
+  connectGlobalWS();
 });
 
 // === Init ===
 (async () => {
-  // Page is served behind HTTP Basic Auth — session is already valid.
-  const [csrfRes, catalogOk, skillsOk] = await Promise.all([
-    fetch("/api/csrf-token"),
+  showView("dashboard");
+  initializeGatewayCards();
+  initializeSkillControls();
+  $("#btn-resources-refresh").addEventListener("click", e => withBusy(e.currentTarget, () => Promise.all([loadSkillCatalog(), loadResources()]), "Refreshing…"));
+  await Promise.all([
     loadAgentCatalog(),
     loadSkillCatalog(),
+    loadResources(),
   ]);
-  if (csrfRes.ok) {
-    const data = await csrfRes.json();
-    csrfToken = data.csrf_token;
-  }
-  if (!catalogOk || !skillsOk) return;
-
+  await loadDefaultAgent();
+  if (!appAlive) return;
+  window.addEventListener("hashchange", handleHashChange);
   connectGlobalWS();
   await handleDeepLink();
-  loadDefaultAgent();
   loadConnections();
 })();

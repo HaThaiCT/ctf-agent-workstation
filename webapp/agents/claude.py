@@ -7,19 +7,18 @@ import hashlib
 import json
 import logging
 import os
-import subprocess
 import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from .base import AgentProvider
+from .base import AgentProvider, GatewayRuntime
+try:
+    from ..runtime_resources import workspace_mcp_servers
+except ImportError:
+    from runtime_resources import workspace_mcp_servers
 
 log = logging.getLogger("ctf-solver.claude")
 
-CLAUDE_STATS_FILE = Path.home() / ".claude" / "stats-cache.json"
-CLAUDE_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
-CLAUDE_CREDENTIALS_FILE = Path.home() / ".claude" / ".credentials.json"
-CLAUDE_USAGE_API = "https://api.anthropic.com/api/oauth/usage"
 
 # Claude CLI `system` message subtypes that are internal status noise. These
 # carry no useful human-readable text, so the parser would otherwise fall back
@@ -51,6 +50,49 @@ def _session_wrapper_path(real_cli: str) -> str:
     return str(path)
 
 
+def claude_gateway_env(runtime: GatewayRuntime) -> dict[str, str]:
+    """Return child-only routing and alias overrides for native Claude."""
+    return {
+        "IS_SANDBOX": "1",
+        "ANTHROPIC_BASE_URL": runtime.config.base_url,
+        "ANTHROPIC_AUTH_TOKEN": runtime.config.api_key,
+        "ANTHROPIC_API_KEY": "",
+        "ANTHROPIC_MODEL": runtime.model,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": runtime.model,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": runtime.model,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": runtime.model,
+    }
+
+
+def _workspace_skill_names(cwd: str | Path) -> list[str]:
+    directory = Path(cwd) / ".claude" / "skills"
+    if not directory.is_dir():
+        return []
+    return sorted(child.name for child in directory.iterdir()
+                  if not child.name.startswith(".") and (child / "SKILL.md").is_file())
+
+
+def _workspace_mcp_servers(cwd: str | Path) -> dict:
+    # Native user/project servers remain inherited; never shadow a same-name server.
+    names = set()
+    for path in (Path.home() / ".claude.json", Path(cwd) / ".mcp.json"):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        names.update(data.get("mcpServers", {}))
+        project = data.get("projects", {}).get(str(Path(cwd).resolve()), {})
+        names.update(project.get("mcpServers", {}))
+    return {name: server for name, server in workspace_mcp_servers(cwd).items()
+            if name not in names}
+
+
+def claude_workspace_cli_args(cwd: str | Path) -> list[str]:
+    """Merge workspace MCPs without replacing inherited native server settings."""
+    return ["--setting-sources", "user,project", "--mcp-config",
+            json.dumps({"mcpServers": _workspace_mcp_servers(cwd)})]
+
+
 # ---------------------------------------------------------------------------
 # SDK-based agent runner
 # ---------------------------------------------------------------------------
@@ -67,6 +109,11 @@ async def _run_agent_sdk(
     **kwargs,
 ) -> AsyncIterator[dict]:
     """Run Claude via the agent SDK, yielding normalized events."""
+    gateway = kwargs.get("_gateway")
+    if not isinstance(gateway, GatewayRuntime):
+        yield {"type": "error", "message": "9router runtime configuration is missing"}
+        return
+    model, effort = gateway.model, gateway.effort
     from claude_agent_sdk import (
         ClaudeSDKClient,
         ClaudeAgentOptions,
@@ -95,7 +142,7 @@ async def _run_agent_sdk(
         resume_session_id = session_state.get("claude_session_id")
 
     # Create notify_teammates MCP tool
-    mcp_servers = {}
+    mcp_servers = _workspace_mcp_servers(cwd)
     if challenge_id and run_id:
         @tool(
             "notify_teammates",
@@ -136,9 +183,7 @@ async def _run_agent_sdk(
             mcp_servers["advisor"] = create_sdk_mcp_server(
                 "advisor", tools=adv_mcp_tools)
 
-    import shutil
-    system_claude = shutil.which("claude")
-    cli_path = _session_wrapper_path(system_claude) if system_claude else None
+    cli_path = _session_wrapper_path(gateway.config.claude_cli)
 
     _stderr_lines: list[str] = []
 
@@ -147,25 +192,27 @@ async def _run_agent_sdk(
         log.warning("Claude CLI stderr: %s", stripped)
         _stderr_lines.append(stripped)
 
-    claude_env = {"IS_SANDBOX": "1"}
-    for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
-        value = os.environ.get(key, "")
-        if value:
-            claude_env[key] = value
-    for key, value in (kwargs.get("_env") or {}).items():
-        if key in {"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"} and value:
-            claude_env[key] = str(value)
+    claude_env = claude_gateway_env(gateway)
+    available_models = kwargs.get("_gateway_models") or [model]
+    selected_skills = _workspace_skill_names(cwd)
 
     options = ClaudeAgentOptions(
         permission_mode="bypassPermissions",
         cwd=str(cwd),
-        model=model or None,
+        model=model,
         effort=effort or None,
         resume=resume_session_id if resume_session_id else None,
+        setting_sources=["user", "project"],
+        skills=selected_skills,
         mcp_servers=mcp_servers if mcp_servers else {},
         cli_path=cli_path,
         stderr=_stderr_handler,
         env=claude_env,
+        settings=json.dumps({
+            "model": model,
+            "availableModels": available_models,
+            "env": {key: value for key, value in claude_env.items() if key != "ANTHROPIC_AUTH_TOKEN"},
+        }),
     )
 
     def _normalize_msg(msg) -> dict | None:
@@ -261,7 +308,14 @@ async def _run_agent_sdk(
             if session_state is not None and data.get("session_id"):
                 session_state["claude_session_id"] = data["session_id"]
             if subtype == "init":
-                return None
+                servers = []
+                for server in data.get("mcp_servers", []):
+                    if not isinstance(server, dict) or not isinstance(server.get("name"), str):
+                        continue
+                    status = server.get("status")
+                    servers.append({"name": server["name"], "status": status if status in {"connected", "failed", "pending", "disabled"} else "unknown"})
+                return {"type": "runtime_resources", "agent": "claude",
+                        "skills": selected_skills, "mcp_servers": servers}
             # Skip internal status subtypes that would otherwise render as
             # yellow status pills in the UI (see _DROP_SYSTEM_SUBTYPES).
             if subtype in _DROP_SYSTEM_SUBTYPES:
@@ -408,6 +462,14 @@ async def _run_agent_sdk(
                 except OSError:
                     _run["_agent_pgid"] = None
 
+        try:
+            status = await client.get_mcp_status()
+            yield {"type": "runtime_resources", "agent": "claude", "skills": selected_skills,
+                   "mcp_servers": [{"name": row["name"], "status": row.get("status", "unknown")}
+                                   for row in status.get("mcpServers", []) if isinstance(row.get("name"), str)]}
+        except Exception as exc:
+            log.warning("Claude MCP status unavailable: %s", exc)
+
         async for msg in client.receive_messages():
                 # Drain broadcast UI events
                 while not _broadcast_ui_events.empty():
@@ -470,232 +532,13 @@ def _normalize_live_event(event: dict, challenge: dict) -> dict | None:
     return event
 
 
-# ---------------------------------------------------------------------------
-# Auth / usage
-# ---------------------------------------------------------------------------
-
-def _get_auth() -> dict | None:
-    try:
-        result = subprocess.run(
-            ["claude", "auth", "status", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            return json.loads(result.stdout)
-    except (
-        subprocess.TimeoutExpired,
-        FileNotFoundError,
-        json.JSONDecodeError,
-    ):
-        pass
-    return None
-
-
-def _get_stats() -> dict | None:
-    if CLAUDE_STATS_FILE.exists():
-        try:
-            return json.loads(CLAUDE_STATS_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return None
-
-
-def _get_oauth_token() -> str | None:
-    if not CLAUDE_CREDENTIALS_FILE.exists():
-        return None
-    try:
-        creds = json.loads(CLAUDE_CREDENTIALS_FILE.read_text())
-        return creds.get("claudeAiOauth", {}).get("accessToken")
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def _fetch_usage_api() -> dict | None:
-    import requests
-
-    token = _get_oauth_token()
-    if not token:
-        return None
-    try:
-        resp = requests.get(
-            CLAUDE_USAGE_API,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "anthropic-beta": "oauth-2025-04-20",
-            },
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception:
-        log.debug("Failed to fetch Claude usage API", exc_info=True)
-    return None
-
-
-def _format_reset_time(iso_str: str | None) -> str:
-    if not iso_str:
-        return ""
-    try:
-        from datetime import datetime, timezone
-        reset = datetime.fromisoformat(iso_str)
-        now = datetime.now(timezone.utc)
-        delta = reset - now
-        secs = int(delta.total_seconds())
-        if secs <= 0:
-            return "now"
-        hours, remainder = divmod(secs, 3600)
-        minutes = remainder // 60
-        if hours > 24:
-            days = hours // 24
-            hours = hours % 24
-            return f"{days}d {hours}h"
-        if hours:
-            return f"{hours}h {minutes}m"
-        return f"{minutes}m"
-    except Exception:
-        return ""
-
-
-def _get_usage_data() -> dict | None:
-    auth = _get_auth()
-    if not auth or not auth.get("loggedIn"):
-        return None
-
-    data = {
-        "auth_rows": [
-            {"label": "Account", "value": auth.get("email", "")},
-            {
-                "label": "Plan",
-                "value": auth.get("subscriptionType", ""),
-            },
-            {"label": "Org", "value": auth.get("orgName", "")},
-        ],
-        "stat_rows": [],
-        "daily_activity": [],
-        "daily_activity_title": "Daily Activity (Claude)",
-    }
-
-    usage_api = _fetch_usage_api()
-    if usage_api:
-        five = usage_api.get("five_hour") or {}
-        seven = usage_api.get("seven_day") or {}
-        if "utilization" in five:
-            reset = _format_reset_time(five.get("resets_at"))
-            label = "5h usage"
-            if reset:
-                label += f" (resets in {reset})"
-            data["stat_rows"].append({
-                "label": label,
-                "value": f"{five['utilization']:.0f}%",
-                "bar": five["utilization"],
-            })
-        if "utilization" in seven:
-            reset = _format_reset_time(seven.get("resets_at"))
-            label = "Weekly usage"
-            if reset:
-                label += f" (resets in {reset})"
-            data["stat_rows"].append({
-                "label": label,
-                "value": f"{seven['utilization']:.0f}%",
-                "bar": seven["utilization"],
-            })
-
-        for key, display in (
-            ("seven_day_opus", "Opus weekly"),
-            ("seven_day_sonnet", "Sonnet weekly"),
-        ):
-            bucket = usage_api.get(key)
-            if bucket and "utilization" in bucket:
-                reset = _format_reset_time(bucket.get("resets_at"))
-                label = display
-                if reset:
-                    label += f" (resets in {reset})"
-                data["stat_rows"].append({
-                    "label": label,
-                    "value": f"{bucket['utilization']:.0f}%",
-                    "bar": bucket["utilization"],
-                })
-
-        extra = usage_api.get("extra_usage") or {}
-        if extra.get("is_enabled"):
-            used = extra.get("used_credits", 0)
-            limit = extra.get("monthly_limit", 0)
-            currency = extra.get("currency", "USD")
-            pct = extra.get("utilization", 0)
-            data["stat_rows"].append({
-                "label": "Extra usage credits",
-                "value": f"{currency} {used:,.0f} / {limit:,.0f}",
-                "bar": pct,
-            })
-
-    stats = _get_stats()
-    if stats:
-        total_sessions = stats.get("totalSessions", 0)
-        total_messages = stats.get("totalMessages", 0)
-        if total_sessions:
-            data["stat_rows"].append({
-                "label": "Sessions",
-                "value": str(total_sessions),
-            })
-        if total_messages:
-            data["stat_rows"].append({
-                "label": "Messages",
-                "value": f"{total_messages:,}",
-            })
-        for model, tok_usage in stats.get("modelUsage", {}).items():
-            input_tokens = tok_usage.get("inputTokens", 0)
-            input_tokens += tok_usage.get("cacheReadInputTokens", 0)
-            input_tokens += tok_usage.get("cacheCreationInputTokens", 0)
-            output_tokens = tok_usage.get("outputTokens", 0)
-            total_tokens = input_tokens + output_tokens
-            data["stat_rows"].append({
-                "label": model,
-                "value": (
-                    f"{total_tokens / 1000:.0f}k tokens "
-                    f"({input_tokens / 1000:.0f}k in / "
-                    f"{output_tokens / 1000:.0f}k out)"
-                ),
-            })
-        data["daily_activity"] = stats.get("dailyActivity", [])
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Provider definition
-# ---------------------------------------------------------------------------
-
 provider = AgentProvider(
     name="claude",
     label="Claude",
-    models=(
-        ("", "Provider default"),
-        ("claude-fable-5", "Fable 5.0"),
-        ("claude-opus-4-8", "Opus 4.8"),
-        ("claude-opus-4-7", "Opus 4.7"),
-        ("claude-sonnet-4-6", "Sonnet 4.6"),
-        ("claude-opus-4-6", "Opus 4.6"),
-        ("claude-opus-4-6[1m]", "Opus 4.6 (1M)"),
-        ("claude-opus-4-5-20251101", "Opus 4.5"),
-        ("claude-haiku-4-5-20251001", "Haiku 4.5"),
-        ("claude-sonnet-4-5-20250929", "Sonnet 4.5"),
-    ),
-    default_model="claude-opus-4-6[1m]",
-    auth_connect_command="claude auth login",
+    effort_levels=("low", "medium", "high", "xhigh", "max"),
     badge_mode="model",
     build_command=_build_command,
     normalize_saved_events=_normalize_saved_events,
     normalize_live_event=_normalize_live_event,
-    get_usage_data=_get_usage_data,
     run_agent=_run_agent_sdk,
-    effort_levels=(
-        ("", "Provider default"),
-        ("low", "Low"),
-        ("medium", "Medium"),
-        ("high", "High"),
-        ("xhigh", "XHigh"),
-        ("max", "Max"),
-    ),
-    default_effort="high",
 )

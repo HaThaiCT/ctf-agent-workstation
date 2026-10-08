@@ -2,7 +2,7 @@
 """CTF Challenge Solver Web App.
 
 Runs coding-agent integrations to solve CTF challenges, streaming
-normalized output to authenticated users via WebSocket.
+normalized output to local browser clients via WebSocket.
 
 Supports 2 solving modes:
 - single: One run.
@@ -33,7 +33,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("ctf-solver")
 import mimetypes
-import pty
+
 import secrets
 import signal
 import subprocess
@@ -41,11 +41,25 @@ import shutil
 import tempfile
 import uuid
 import time as _time
-from collections import defaultdict, deque
+from collections import deque
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, urlparse
+
+try:
+    from .model_gateway import ModelGateway, GatewayRuntime, GatewayError, gateway_agent_metadata, resolve_gateway_selection
+except ImportError:
+    from model_gateway import ModelGateway, GatewayRuntime, GatewayError, gateway_agent_metadata, resolve_gateway_selection
+
+try:
+    from .runtime_resources import (skill_source_roots, bootstrap_skill_sources,
+                                    select_automatic_skills, builtin_mcp_status,
+                                    prepare_workspace_mcp)
+except ImportError:
+    from runtime_resources import (skill_source_roots, bootstrap_skill_sources,
+                                   select_automatic_skills, builtin_mcp_status,
+                                   prepare_workspace_mcp)
 
 try:
     from .discord_bot import (
@@ -84,21 +98,12 @@ except ImportError:
     from plugins.base import RemoteFile, RemoteFileTooLarge, format_bytes  # type: ignore
 
 from starlette.applications import Starlette
-from starlette.middleware import Middleware
-from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, HTMLResponse, Response
 from starlette.routing import Route, WebSocketRoute, Mount
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-APP_PASSWORD = os.environ["APP_PASSWORD"]
-SESSION_SECRET = os.environ["SESSION_SECRET"]
-if len(SESSION_SECRET) < 32:
-    raise ValueError(
-        "SESSION_SECRET must be at least 32 characters. "
-        "Generate one with: python3 -c \"import secrets; print(secrets.token_hex(32))\""
-    )
 TLS_ENABLED = bool(os.environ.get("TLS_CERTFILE"))
 ALLOWED_ORIGINS = {
     origin.strip()
@@ -110,11 +115,6 @@ CHALLENGES_DIR = APP_ROOT_DIR / "challenges"
 CHALLENGES_DIR.mkdir(parents=True, exist_ok=True)
 STATE_ROOT_DIR = APP_ROOT_DIR / "state"
 STATE_ROOT_DIR.mkdir(parents=True, exist_ok=True)
-
-# Rate limiting for login
-MAX_LOGIN_ATTEMPTS = 5
-LOGIN_WINDOW_SECONDS = 300
-_login_attempts: dict[str, list[float]] = defaultdict(list)
 
 HISTORY_TOOL_OUTPUT_PREVIEW_CHARS = int(os.environ.get(
     "HISTORY_TOOL_OUTPUT_PREVIEW_CHARS", "12000"
@@ -149,21 +149,7 @@ DISCORD_FLAG_REVIEW_ACTIONS = {
     "flag_correct",
     "flag_broadcast",
 }
-AUTH_SESSION_TTL_SECONDS = 10 * 60
-AUTH_STATUS_TIMEOUT_SECONDS = 8
-AUTH_COMMANDS = {
-    "claude": {
-        "default": ("claude", "auth", "login"),
-    },
-    "codex": {
-        "default": ("codex", "login", "--device-auth"),
-    },
-}
-AUTH_STATUS_COMMANDS = {
-    "claude": ("claude", "auth", "status", "--json"),
-    "codex": ("codex", "login", "status"),
-}
-_agent_auth_sessions: dict[str, dict] = {}
+
 
 
 def load_connections() -> list[dict]:
@@ -230,69 +216,7 @@ def save_plugin_connection(
     return conn_id
 
 
-def load_agent_env_auth() -> dict:
-    """Load persisted provider environment credentials."""
-    if AGENT_ENV_AUTH_FILE.exists():
-        try:
-            data = json.loads(AGENT_ENV_AUTH_FILE.read_text())
-            if isinstance(data, dict):
-                return data
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
 
-
-def save_agent_env_auth(data: dict) -> None:
-    """Persist provider environment credentials with owner-only perms."""
-    AGENT_ENV_AUTH_FILE.write_text(json.dumps(data, indent=2))
-    try:
-        AGENT_ENV_AUTH_FILE.chmod(0o600)
-    except OSError:
-        pass
-
-
-def _stored_agent_env_auth(agent: str) -> dict:
-    data = load_agent_env_auth()
-    entry = data.get(agent)
-    return entry if isinstance(entry, dict) else {}
-
-
-def agent_runtime_env(agent: str) -> dict[str, str]:
-    """Return persisted/process env vars needed by a provider at runtime."""
-    env: dict[str, str] = {}
-    if agent != "claude":
-        return env
-    stored = _stored_agent_env_auth(agent)
-    for key in CLAUDE_ENV_AUTH_KEYS:
-        value = str_field(stored.get(key, "")).strip()
-        if not value:
-            value = os.environ.get(key, "").strip()
-        if value:
-            env[key] = value
-    return env
-
-
-def public_agent_env_auth(agent: str) -> dict:
-    """Return non-secret env credential metadata for the UI/status API."""
-    if agent != "claude":
-        return {"supported": False, "configured": False}
-    stored = _stored_agent_env_auth(agent)
-    runtime = agent_runtime_env(agent)
-    stored_token = bool(str_field(stored.get("ANTHROPIC_AUTH_TOKEN", "")).strip())
-    process_token = bool(os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip())
-    stored_value = any(
-        str_field(stored.get(key, "")).strip()
-        for key in CLAUDE_ENV_AUTH_KEYS
-    )
-    source = "stored" if stored_token else "process" if process_token else ""
-    return {
-        "supported": True,
-        "configured": bool(runtime.get("ANTHROPIC_AUTH_TOKEN")),
-        "base_url": runtime.get("ANTHROPIC_BASE_URL", ""),
-        "token_set": bool(runtime.get("ANTHROPIC_AUTH_TOKEN")),
-        "saved": stored_value,
-        "source": source,
-    }
 
 
 def utc_now_iso() -> str:
@@ -614,8 +538,9 @@ METADATA_FILE = "challenge.json"
 OUTPUT_FILE = "output.jsonl"
 SETTINGS_FILE = CHALLENGES_DIR / "settings.json"
 AGENT_ENV_AUTH_FILE = STATE_ROOT_DIR / "agent-env-auth.json"
-CLAUDE_ENV_AUTH_KEYS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN")
-REPO_SKILLS_DIR = APP_ROOT_DIR / "skills"
+model_gateway = ModelGateway(AGENT_ENV_AUTH_FILE)
+REPO_ROOT_DIR = Path(__file__).resolve().parent.parent
+REPO_SKILLS_DIR = REPO_ROOT_DIR / "skills"
 ALL_SKILLS_DIR = APP_ROOT_DIR / "all-skills"
 PROJECT_SKILL_DIRS = (
     Path(".claude") / "skills",
@@ -1013,6 +938,7 @@ def public_run_summary(
         "error": run.get("error"),
         "duration_ms": effective_run_duration_ms(run),
         "enabled_skills": run_enabled_skills(challenge, run, settings),
+        "skills_mode": skills_mode(run, scope="run"),
         "skill_override": run_has_skill_override(run),
         "goal": normalize_run_goal(run.get("goal"), str(run.get("agent") or "")),
         "goal_editable": run_goal_editable(run),
@@ -2010,7 +1936,9 @@ def _skill_entry_from_file(skill_file: Path, root: Path) -> dict | None:
         rel_path = skill_file.parent.relative_to(APP_ROOT_DIR).as_posix()
     except ValueError:
         rel_path = skill_file.parent.name
-    source = "catalog" if _path_under(skill_file, ALL_SKILLS_DIR) else "repo"
+    source = ("catalog" if _path_under(skill_file, ALL_SKILLS_DIR) else
+              "category" if _path_under(skill_file, APP_ROOT_DIR / "cache/ctf-skills") else
+              "uploaded" if _path_under(skill_file, APP_ROOT_DIR / "skills") and root != REPO_SKILLS_DIR else "repo")
     return {
         "name": name,
         "description": description,
@@ -2023,6 +1951,7 @@ def _skill_entry_from_file(skill_file: Path, root: Path) -> dict | None:
 
 _skill_catalog_cache: list[dict] | None = None
 _skill_catalog_by_name_cache: dict[str, dict] | None = None
+_category_catalog_status = {"status": "pending", "error": ""}
 
 
 def invalidate_skill_catalog_cache() -> None:
@@ -2038,10 +1967,13 @@ def discover_skill_catalog() -> list[dict]:
         return _skill_catalog_cache
 
     entries: dict[str, dict] = {}
-    for root in (REPO_SKILLS_DIR, ALL_SKILLS_DIR):
+    for root in skill_source_roots(APP_ROOT_DIR, REPO_ROOT_DIR):
         if not root.exists():
             continue
         for skill_file in sorted(root.rglob("SKILL.md")):
+            if any(part.startswith(".") or part in {"tests", "test", "fixtures", "testfixtures"}
+                   for part in skill_file.relative_to(root).parts[:-1]):
+                continue
             entry = _skill_entry_from_file(skill_file, root)
             if entry:
                 entries[entry["name"]] = entry
@@ -2061,24 +1993,8 @@ def skill_catalog_by_name() -> dict[str, dict]:
     return _skill_catalog_by_name_cache
 
 
-# Skills enabled by default for new challenges (when the operator has not
-# customized the set in Settings). Tool/forensics skills that should always be
-# available; category/tool-specific skills like the ROP and crypto
-# skills are left off so they load on demand via their triggers.
-DEFAULT_ENABLED_SKILLS = [
-    "kernel-gef-debugging",
-    "analyze-with-ida-domain-api",
-    "apk-analysis",
-    "volatility3-memdump",
-    "file-repair-and-stego",
-    "tsk-disk-recovery",
-    "pcap-extraction",
-]
-
-
 def default_enabled_skill_names() -> list[str]:
-    available = {entry["name"] for entry in discover_skill_catalog()}
-    return [name for name in DEFAULT_ENABLED_SKILLS if name in available]
+    return select_automatic_skills({}, discover_skill_catalog())
 
 
 def _coerce_skill_list(value: object) -> list[str] | None:
@@ -2149,10 +2065,10 @@ def public_skill_catalog(settings: dict | None = None) -> dict:
         skills.append(public)
     return {
         "skills": skills,
-        "default_enabled_skills": normalize_enabled_skills(
-            settings.get("enabled_skills"),
-            default=default_enabled_skill_names(),
-        ),
+        "skills_mode": skills_mode(settings, scope="settings"),
+        "skills_count": len(skills),
+        "category_catalog": dict(_category_catalog_status),
+        "default_enabled_skills": challenge_enabled_skills({}, settings),
     }
 
 
@@ -2286,37 +2202,87 @@ def _extract_uploaded_skill_zip(
     return extract_dir, skill_fallback, None
 
 
-def challenge_enabled_skills(
-    challenge: dict,
-    settings: dict | None = None,
-) -> list[str]:
+def skills_mode(value: dict, *, scope: str) -> str:
+    """Infer legacy policy without converting explicit selections into snapshots."""
+    allowed = {"auto", "manual", "inherit"} if scope == "run" else {"auto", "manual"}
+    mode = value.get("skills_mode")
+    if isinstance(mode, str) and mode in allowed:
+        return mode
+    requested = _coerce_skill_list(value.get("enabled_skills"))
+    if scope == "settings":
+        return "manual" if requested else "auto"
+    if value.get("enabled_skills") is not None:
+        return "manual"
+    return "inherit" if scope == "run" else "auto"
+
+
+def skill_policy_from_request(value, *, scope: str, parent: dict | None = None) -> dict:
+    allowed = {"auto", "manual", "inherit"} if scope == "run" else {"auto", "manual"}
+    parent = parent if parent is not None else load_settings()
+    mode = value.get("skills_mode")
+    if mode is not None and (not isinstance(mode, str) or mode not in allowed):
+        raise GatewayError("Invalid skills mode", 400)
+    if mode is None:
+        mode = "manual" if "enabled_skills" in value else (
+            "inherit" if scope == "run" else skills_mode(parent or load_settings(), scope="settings"))
+    manual = value.get("enabled_skills") if "enabled_skills" in value else (parent or {}).get("enabled_skills")
+    return {"skills_mode": mode, "enabled_skills": (_coerce_skill_list(manual) or []) if mode == "manual" else []}
+
+
+def persisted_skill_policy(value: dict, *, scope: str) -> dict:
+    mode = skills_mode(value, scope=scope)
+    return {"skills_mode": mode, "enabled_skills": (_coerce_skill_list(value.get("enabled_skills")) or []) if mode == "manual" else []}
+
+
+def challenge_skills_mode(challenge: dict, settings: dict | None = None) -> str:
+    if isinstance(challenge.get("skills_mode"), str) and challenge["skills_mode"] in {"auto", "manual"} or challenge.get("enabled_skills") is not None:
+        return skills_mode(challenge, scope="challenge")
+    return skills_mode(settings or load_settings(), scope="settings")
+
+
+def challenge_enabled_skills(challenge: dict, settings: dict | None = None) -> list[str]:
     settings = settings or load_settings()
-    return normalize_enabled_skills(
-        challenge.get("enabled_skills"),
-        default=normalize_enabled_skills(settings.get("enabled_skills")),
-    )
+    if challenge_skills_mode(challenge, settings) == "auto":
+        return select_automatic_skills(challenge, discover_skill_catalog())
+    requested = challenge.get("enabled_skills")
+    return normalize_enabled_skills(requested if requested is not None else settings.get("enabled_skills"), default=[])
 
 
 def run_has_skill_override(run: dict) -> bool:
-    return run.get("enabled_skills") is not None
+    return skills_mode(run, scope="run") != "inherit"
 
 
-def run_enabled_skills(
-    challenge: dict,
-    run: dict,
-    settings: dict | None = None,
-) -> list[str]:
-    if run_has_skill_override(run):
+def run_enabled_skills(challenge: dict, run: dict, settings: dict | None = None) -> list[str]:
+    mode = skills_mode(run, scope="run")
+    if mode == "auto":
+        return select_automatic_skills(challenge, discover_skill_catalog())
+    if mode == "manual":
         return normalize_enabled_skills(run.get("enabled_skills"), default=[])
     return challenge_enabled_skills(challenge, settings)
+
+
+async def prepare_runtime_resources(challenge: dict, run: dict, cwd: Path) -> dict:
+    """Resolve public selection and materialize child-only resources before launch."""
+    selected = run_enabled_skills(challenge, run)
+    await asyncio.to_thread(sync_skill_links, cwd, selected)
+    mcp = await asyncio.to_thread(prepare_workspace_mcp, cwd, REPO_ROOT_DIR)
+    mode = skills_mode(run, scope="run")
+    return {"type": "runtime_resources", "agent": run.get("agent", ""),
+            "skills_mode": mode, "effective_skills_mode": challenge_skills_mode(challenge) if mode == "inherit" else mode,
+            "enabled_skills": selected, "skills": selected, "mcp": [mcp],
+            "category_catalog": dict(_category_catalog_status)}
 
 
 def sync_run_skill_links(challenge: dict, run: dict) -> None:
     """Materialize selected project skills into this run's provider dirs."""
     run_dir = get_run_cwd(challenge["id"], run)
     selected = run_enabled_skills(challenge, run)
-    catalog = skill_catalog_by_name()
 
+    sync_skill_links(run_dir, selected)
+
+
+def sync_skill_links(run_dir: Path, selected: list[str]) -> None:
+    catalog = skill_catalog_by_name()
     for rel_dir in PROJECT_SKILL_DIRS:
         skills_dir = run_dir / rel_dir
         skills_dir.mkdir(parents=True, exist_ok=True)
@@ -2355,6 +2321,7 @@ def load_settings() -> dict:
         "agent_models": {},
         "agent_efforts": {},
         "enabled_skills": None,
+        "skills_mode": None,
         "enabled_hooks": [],
         "max_platform_import_size_gb": DEFAULT_MAX_PLATFORM_IMPORT_SIZE_GB,
         "discord_enabled": False,
@@ -2379,10 +2346,7 @@ def load_settings() -> dict:
     defaults["discord_challenge_layout"] = normalize_discord_challenge_layout(
         defaults.get("discord_challenge_layout")
     )
-    defaults["enabled_skills"] = normalize_enabled_skills(
-        defaults.get("enabled_skills"),
-        default=default_enabled_skill_names(),
-    )
+    defaults.update(persisted_skill_policy(defaults, scope="settings"))
     defaults["enabled_hooks"] = normalize_enabled_hooks(
         defaults.get("enabled_hooks")
     )
@@ -2721,6 +2685,8 @@ def settings_for_client(settings: dict) -> dict:
     sa = swarm.pop("service_account", None)
     swarm["service_account_configured"] = bool(sa)
     out["swarm"] = swarm
+    out["skills_mode"] = skills_mode(settings, scope="settings")
+    out["enabled_skills"] = challenge_enabled_skills({}, settings)
     return out
 
 
@@ -2748,8 +2714,7 @@ def _serialize_runs(challenge: dict) -> dict:
             "event_count": run_event_count(challenge["id"], run_id, run),
             "goal": normalize_run_goal(run.get("goal"), str(run.get("agent") or "")),
         }
-        if run_has_skill_override(run):
-            run_meta["enabled_skills"] = run_enabled_skills(challenge, run)
+        run_meta.update(persisted_skill_policy(run, scope="run"))
         if run.get("custom_prompt"):
             run_meta["custom_prompt"] = run["custom_prompt"]
             run_meta["custom_prompt_mode"] = run.get(
@@ -2774,7 +2739,7 @@ def save_metadata(challenge: dict) -> None:
         "status": challenge["status"],
         "created_at": challenge["created_at"],
         "files": challenge["files"],
-        "enabled_skills": challenge_enabled_skills(challenge),
+        **persisted_skill_policy(challenge, scope="challenge"),
         "error": challenge.get("error"),
         "runs": _serialize_runs(challenge),
         "_plugin": challenge.get("_plugin", ""),
@@ -2802,57 +2767,95 @@ def save_metadata(challenge: dict) -> None:
 # Agent/model resolution helpers
 # ---------------------------------------------------------------------------
 
-def parse_agents_field(agents_str: str) -> list[dict]:
-    """Parse agents field from frontend.
-
-    Accepts either:
-    - A plain agent name: "claude"
-    - Comma-separated names: "claude,codex"
-    - JSON array of {agent, model} objects: '[{"agent":"claude","model":"opus"}]'
-
-    Returns list of {"agent": str, "model": str} dicts.
-    """
-    if not agents_str:
-        return []
-    agents_str = agents_str.strip()
-    if agents_str.startswith("["):
+def parse_agents_field(value) -> list[dict]:
+    """Parse exact per-harness tuples without losing missing-key semantics."""
+    if isinstance(value, str):
         try:
-            parsed = json.loads(agents_str)
-            if isinstance(parsed, list):
-                return [
-                    {
-                        "agent": str_field(entry.get("agent", "")) if isinstance(entry, dict) else str_field(entry),
-                        "model": str_field(entry.get("model", "")) if isinstance(entry, dict) else "",
-                        "effort": str_field(entry.get("effort", "")) if isinstance(entry, dict) else "",
-                    }
-                    for entry in parsed
-                ]
-        except json.JSONDecodeError:
-            pass
-    return [{"agent": a.strip(), "model": "", "effort": ""} for a in agents_str.split(",") if a.strip()]
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            raise GatewayError("At least one agent is required", 400)
+    if not isinstance(value, list) or not value or any(not isinstance(row, dict) for row in value):
+        raise GatewayError("At least one agent is required", 400)
+    return [{key: row[key] for key in ("agent", "model", "effort") if key in row} for row in value]
 
 
-def resolved_default_model(agent: str) -> str:
-    return get_provider(agent).resolved_default_model()
+def native_effort_levels(agent: str) -> tuple[str, ...]:
+    if not isinstance(agent, str) or agent not in VALID_AGENTS:
+        raise GatewayError(f"invalid agent: {agent}", 400)
+    return tuple(level[0] if isinstance(level, tuple) else level for level in get_provider(agent).effort_levels)
 
 
-def resolved_default_effort(agent: str) -> str:
-    provider = get_provider(agent)
-    values = [value for value, _ in provider.effort_levels if value]
-    default = provider.default_effort
-    if values and default not in values:
-        default = values[0]
-    return default if default in values else ""
+async def gateway_settings(settings: dict | None = None) -> dict:
+    return {**(load_settings() if settings is None else settings), "native_models": await asyncio.to_thread(model_gateway.native_models)}
 
 
-def normalize_effort_for_agent(agent: str, effort: str) -> str:
-    provider = get_provider(agent)
-    allowed = {value for value, _ in provider.effort_levels if value}
-    if not allowed:
-        return ""
-    if effort in allowed:
-        return effort
-    return resolved_default_effort(agent)
+def guard_gateway_swarm(requested: str = "", challenge: dict | None = None) -> None:
+    host = urlparse(model_gateway.load_config().base_url).hostname or ""
+
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host.lower() == "localhost"
+    remote = requested not in ("", "local") or bool((challenge or {}).get("_swarm_instance"))
+    if remote:
+        message = "Local 9router is not reachable from swarm workers; select Local" if loopback else "9router native runtime is unavailable on swarm workers; select Local"
+        raise GatewayError(message, 400)
+
+
+async def resolve_agent_entries(source, *, mode: str = "parallel", settings: dict | None = None) -> list[dict]:
+    settings = await gateway_settings(settings)
+    if "agents" in source:
+        rows = parse_agents_field(source["agents"])
+    else:
+        enabled = settings.get("enabled_agents") or [settings.get("default_agent") or DEFAULT_AGENT]
+        rows = [{"agent": agent} for agent in enabled]
+    guard_gateway_swarm(str_field(source.get("swarm_instance", "")).strip())
+    for row in rows:
+        native_effort_levels(row.get("agent", ""))
+    models = await model_gateway.catalog()
+    if not models:
+        raise GatewayError("9router model catalog is empty")
+    resolved = []
+    seen = set()
+    for row in rows:
+        selection = resolve_gateway_selection(row, models=models, settings=settings, native_levels=native_effort_levels(row["agent"]))
+        await model_gateway.runtime(row["agent"], selection, models, native_effort_levels(row["agent"]))
+        key = tuple(selection[key] for key in ("agent", "model", "effort"))
+        if key not in seen:
+            seen.add(key)
+            resolved.append(selection)
+    return resolved[:1] if mode == "single" else resolved
+
+
+async def prepare_gateway_run(challenge: dict, run: dict) -> GatewayRuntime:
+    guard_gateway_swarm(challenge=challenge)
+    agent = run.get("agent", "")
+    levels = native_effort_levels(agent)
+    models = await model_gateway.catalog()
+    if not models:
+        raise GatewayError("9router model catalog is empty")
+    selection = {"agent": agent, "model": run.get("model", ""), "effort": run.get("effort", "")}
+    try:
+        return await model_gateway.runtime(agent, selection, models, levels)
+    except GatewayError as exc:
+        if exc.status_code == 400:
+            raise GatewayError(exc.public_message + "; use Add Agent to create a new run with a 9router model", 400) from exc
+        raise
+
+
+def gateway_error_response(exc: GatewayError) -> JSONResponse:
+    return JSONResponse({"error": exc.public_message}, status_code=exc.status_code)
+
+def gateway_child_env(runtime: GatewayRuntime, agent: str) -> dict[str, str]:
+    if agent == "claude":
+        try:
+            from .agents.claude import claude_gateway_env
+        except ImportError:
+            from agents.claude import claude_gateway_env
+        return claude_gateway_env(runtime)
+    return {"CTF_GATEWAY_API_KEY": runtime.config.api_key}
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -2899,14 +2902,8 @@ def load_challenges_from_disk() -> None:
                 run = make_run(
                     run_id=run_id,
                     agent=run_agent,
-                    model=run_meta.get(
-                        "model",
-                        resolved_default_model(run_agent),
-                    ),
-                    effort=run_meta.get(
-                        "effort",
-                        resolved_default_effort(run_agent),
-                    ),
+                    model=run_meta.get("model", ""),
+                    effort=run_meta.get("effort", ""),
                     status=run_status,
                 )
                 run["error"] = run_meta.get("error")
@@ -2917,11 +2914,7 @@ def load_challenges_from_disk() -> None:
                 )
                 if run_meta.get("notes_label"):
                     run["notes_label"] = run_meta["notes_label"]
-                if "enabled_skills" in run_meta:
-                    run["enabled_skills"] = normalize_enabled_skills(
-                        run_meta.get("enabled_skills"),
-                        default=[],
-                    )
+                run.update(persisted_skill_policy(run_meta, scope="run"))
                 custom_prompt = str(
                     run_meta.get("custom_prompt") or ""
                 ).strip()
@@ -2966,14 +2959,8 @@ def load_challenges_from_disk() -> None:
             run = make_run(
                 run_id=run_id,
                 agent=old_agent,
-                model=meta.get(
-                    "model",
-                    resolved_default_model(old_agent),
-                ),
-                effort=meta.get(
-                    "effort",
-                    resolved_default_effort(old_agent),
-                ),
+                model=meta.get("model", ""),
+                effort=meta.get("effort", ""),
                 status=old_status,
             )
             run["error"] = meta.get("error")
@@ -3021,12 +3008,7 @@ def load_challenges_from_disk() -> None:
             "description": meta.get("description", ""),
             "flag_format": meta.get("flag_format", ""),
             "extra_flag_formats": meta.get("extra_flag_formats", []),
-            "enabled_skills": normalize_enabled_skills(
-                meta.get("enabled_skills"),
-                default=normalize_enabled_skills(
-                    load_settings().get("enabled_skills")
-                ),
-            ),
+            **persisted_skill_policy(meta if meta.get("enabled_skills") is not None or meta.get("skills_mode") else load_settings(), scope="challenge"),
             "mode": mode,
             "status": "pending",
             "created_at": meta.get(
@@ -3078,56 +3060,18 @@ set_discord_hook(_discord_breakthrough_hook)
 
 
 # ---------------------------------------------------------------------------
-# Auth and CSRF
+# Same-origin browser checks
 # ---------------------------------------------------------------------------
 
-def _check_basic_auth(auth_header: str) -> bool:
-    """Validate HTTP Basic Auth credentials (any username, password = APP_PASSWORD)."""
-    if not auth_header.startswith("Basic "):
-        return False
-    try:
-        import base64
-        decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
-        _, _, password = decoded.partition(":")
-        return secrets.compare_digest(password, APP_PASSWORD)
-    except Exception:
-        return False
-
-
-def require_auth(request: Request) -> Response | None:
-    if request.session.get("authenticated"):
-        return None
-
-    client_ip = request.client.host if request.client else "unknown"
-    if err := _check_rate_limit(client_ip):
-        return err
-
-    auth = request.headers.get("authorization", "")
-    if _check_basic_auth(auth):
-        _login_attempts.pop(client_ip, None)
-        request.session["authenticated"] = True
-        return None
-    if auth:
-        _login_attempts[client_ip].append(_time.monotonic())
-    return Response(
-        content="Unauthorized",
-        status_code=401,
-        headers={"WWW-Authenticate": 'Basic realm="CTF Solver"'},
-    )
-
-
-def require_csrf(request: Request) -> JSONResponse | None:
-    """Reject state-changing requests missing a valid CSRF token."""
-    token = request.headers.get("x-csrf-token", "")
-    session_token = request.session.get("csrf_token", "")
-    if not token or not session_token:
-        return JSONResponse(
-            {"error": "missing csrf token"}, status_code=403
-        )
-    if not secrets.compare_digest(token, session_token):
-        return JSONResponse(
-            {"error": "invalid csrf token"}, status_code=403
-        )
+def require_same_origin(request: Request) -> JSONResponse | None:
+    """Reject cross-origin browser mutations without requiring tokens for CLI use."""
+    if request.headers.get("sec-fetch-site", "") == "cross-site":
+        return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
+    origin = request.headers.get("origin", "")
+    if origin:
+        parsed = urlparse(origin)
+        if parsed.scheme != request.url.scheme or parsed.netloc != request.headers.get("host", ""):
+            return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
     return None
 
 
@@ -3151,20 +3095,6 @@ def str_field(value: object, default: str = "") -> str:
     return str(value)
 
 
-def _check_rate_limit(client_ip: str) -> JSONResponse | None:
-    """Block login if too many recent failures from this IP."""
-    now = _time.monotonic()
-    attempts = _login_attempts[client_ip]
-    # Prune old attempts outside the window
-    _login_attempts[client_ip] = [
-        t for t in attempts if now - t < LOGIN_WINDOW_SECONDS
-    ]
-    if len(_login_attempts[client_ip]) >= MAX_LOGIN_ATTEMPTS:
-        return JSONResponse(
-            {"error": "too many login attempts, try again later"},
-            status_code=429,
-        )
-    return None
 
 
 def websocket_origin_allowed(websocket: WebSocket) -> bool:
@@ -3188,14 +3118,6 @@ def websocket_origin_allowed(websocket: WebSocket) -> bool:
 # ---------------------------------------------------------------------------
 
 async def index(request: Request) -> Response:
-    # Support ?token=PASSWORD for easy bookmarkable login
-    token = request.query_params.get("token", "")
-    if token and secrets.compare_digest(token, APP_PASSWORD):
-        request.session["authenticated"] = True
-        from starlette.responses import RedirectResponse
-        return RedirectResponse(url="/", status_code=302)
-    if err := require_auth(request):
-        return err
     html_path = Path(__file__).parent / "static" / "index.html"
     return HTMLResponse(
         html_path.read_text(),
@@ -3203,44 +3125,10 @@ async def index(request: Request) -> Response:
     )
 
 
-async def login(request: Request) -> JSONResponse:
-    client_ip = request.client.host if request.client else "unknown"
-    if err := _check_rate_limit(client_ip):
-        return err
-
-    body, json_err = await read_json_object(request)
-    if json_err:
-        return json_err
-    password = str_field(body.get("password", ""))
-    if secrets.compare_digest(password, APP_PASSWORD):
-        _login_attempts.pop(client_ip, None)
-        csrf_token = secrets.token_hex(32)
-        request.session["authenticated"] = True
-        request.session["csrf_token"] = csrf_token
-        return JSONResponse({"ok": True, "csrf_token": csrf_token})
-
-    _login_attempts[client_ip].append(_time.monotonic())
-    return JSONResponse({"error": "invalid password"}, status_code=403)
 
 
-async def logout(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
-        return err
-    request.session.clear()
-    return JSONResponse({"ok": True})
 
 
-async def csrf_token(request: Request) -> JSONResponse:
-    """Return the CSRF token for the current session."""
-    if err := require_auth(request):
-        return err
-    token = request.session.get("csrf_token")
-    if not token:
-        token = secrets.token_hex(32)
-        request.session["csrf_token"] = token
-    return JSONResponse({"csrf_token": token})
 
 
 # ---------------------------------------------------------------------------
@@ -3331,6 +3219,7 @@ def public_challenge_summary(
         "created_at": challenge["created_at"],
         "files": challenge["files"],
         "enabled_skills": challenge_enabled_skills(challenge, settings),
+        "skills_mode": challenge_skills_mode(challenge, settings),
         "points": challenge.get("_points", 0),
         "solves": challenge.get("_solves", 0),
         "flag_questions": challenge.get("_flag_questions", []),
@@ -3362,8 +3251,7 @@ def public_challenge_list_summary(challenge: dict) -> dict:
 
 
 async def list_challenges(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
+    
     detail = str(request.query_params.get("detail", "")).lower()
     if detail in {"1", "true", "yes", "full"}:
         settings = load_settings()
@@ -3377,8 +3265,7 @@ async def list_challenges(request: Request) -> JSONResponse:
 
 
 async def get_challenge(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
+    
     challenge_id = request.path_params["id"]
     challenge = challenges.get(challenge_id)
     if not challenge:
@@ -3516,8 +3403,7 @@ async def list_run_events(request: Request) -> JSONResponse:
     Slices are addressed by event index. `before` is an exclusive end index;
     omitting it returns the latest chunk.
     """
-    if err := require_auth(request):
-        return err
+    
 
     challenge_id = request.path_params["id"]
     run_id = request.path_params["run_id"]
@@ -3567,8 +3453,7 @@ async def list_run_events(request: Request) -> JSONResponse:
 
 
 async def get_run_event_tool_output(request: Request) -> Response:
-    if err := require_auth(request):
-        return err
+    
 
     challenge_id = request.path_params["id"]
     run_id = request.path_params["run_id"]
@@ -3607,8 +3492,7 @@ async def get_run_event_tool_output(request: Request) -> Response:
 
 
 async def get_challenge_stats(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
+    
 
     challenge_id = request.path_params["id"]
     challenge = challenges.get(challenge_id)
@@ -3639,8 +3523,7 @@ async def get_challenge_stats(request: Request) -> JSONResponse:
 
 
 async def search_challenge_transcript(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
+    
 
     challenge_id = request.path_params["id"]
     challenge = challenges.get(challenge_id)
@@ -3697,9 +3580,8 @@ async def search_challenge_transcript(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def create_challenge(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     form = await request.form()
@@ -3707,46 +3589,21 @@ async def create_challenge(request: Request) -> JSONResponse:
     description = form.get("description", "").strip()
     flag_format = form.get("flag_format", "").strip()
     mode = form.get("mode", "single").strip()
-    agents_str = form.get("agents", "").strip()
-    model = form.get("model", "").strip()
-    effort = form.get("effort", "").strip()
-    enabled_skills = normalize_enabled_skills(
-        form.get("enabled_skills"),
-        default=normalize_enabled_skills(load_settings().get("enabled_skills")),
-    )
+
+    try:
+        skill_policy = skill_policy_from_request(form, scope="challenge")
+    except GatewayError as exc:
+        return gateway_error_response(exc)
 
     if mode not in VALID_MODES:
         return JSONResponse(
             {"error": f"invalid mode: {mode}"}, status_code=400
         )
 
-    # Determine agent list with per-agent models
-    agent_entries = parse_agents_field(agents_str)
-    if not agent_entries:
-        single_agent = form.get("agent", "").strip() or DEFAULT_AGENT
-        agent_entries = [{"agent": single_agent, "model": model}]
-
-    # Validate agents
-    for entry in agent_entries:
-        if entry["agent"] not in VALID_AGENTS:
-            return JSONResponse(
-                {"error": f"invalid agent: {entry['agent']}"},
-                status_code=400,
-            )
-
-    # For single mode, only use first agent
-    if mode == "single":
-        agent_entries = agent_entries[:1]
-    else:
-        # Deduplicate identical agent+model+effort combos in parallel mode
-        seen: set[tuple] = set()
-        deduped = []
-        for entry in agent_entries:
-            key = (entry["agent"], entry.get("model", ""), entry.get("effort", ""))
-            if key not in seen:
-                seen.add(key)
-                deduped.append(entry)
-        agent_entries = deduped
+    try:
+        agent_entries = await resolve_agent_entries(form, mode=mode)
+    except GatewayError as exc:
+        return gateway_error_response(exc)
 
     # Read uploaded files into memory
     file_data: dict[str, bytes] = {}
@@ -3793,8 +3650,8 @@ async def create_challenge(request: Request) -> JSONResponse:
     for entry in agent_entries:
         agent_name = entry["agent"]
         run_id = uuid.uuid4().hex[:8]
-        run_model = entry.get("model") or model or resolved_default_model(agent_name)
-        run_effort = normalize_effort_for_agent(agent_name, entry.get("effort") or effort)
+        run_model = entry["model"]
+        run_effort = entry["effort"]
         run = make_run(
             run_id=run_id,
             agent=agent_name,
@@ -3821,7 +3678,7 @@ async def create_challenge(request: Request) -> JSONResponse:
         "status": "solving",
         "created_at": datetime.now().isoformat(),
         "files": sorted(file_data.keys()),
-        "enabled_skills": enabled_skills,
+        **skill_policy,
         "error": None,
         "runs": runs,
     }
@@ -3866,9 +3723,8 @@ async def create_challenge(request: Request) -> JSONResponse:
 
 async def bulk_preview(request: Request) -> JSONResponse:
     """Preview uploaded bulk archive and return editable challenge rows."""
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     import io
@@ -4017,9 +3873,8 @@ async def bulk_preview(request: Request) -> JSONResponse:
 
 async def bulk_upload(request: Request) -> JSONResponse:
     """Create challenges from a previously previewed bulk archive."""
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     body, json_err = await read_json_object(request)
@@ -4032,6 +3887,17 @@ async def bulk_upload(request: Request) -> JSONResponse:
             status_code=400,
         )
 
+    mode = str_field(body.get("mode", "single")).strip()
+    if mode not in VALID_MODES:
+        return JSONResponse({"error": f"invalid mode: {mode}"}, status_code=400)
+    try:
+        agent_entries = await resolve_agent_entries(body, mode=mode)
+        default_skill_policy = skill_policy_from_request(body, scope="challenge")
+        for cfg in body.get("challenges", []):
+            if isinstance(cfg, dict):
+                skill_policy_from_request(cfg, scope="challenge", parent=default_skill_policy)
+    except GatewayError as exc:
+        return gateway_error_response(exc)
     preview = _bulk_previews.pop(token)
     base_dir = preview["base_dir"]
     preview_folders = preview["folders"]
@@ -4042,36 +3908,9 @@ async def bulk_upload(request: Request) -> JSONResponse:
         if mode not in VALID_MODES:
             mode = "single"
 
-        # Determine agents with per-agent models
-        agents_str = body.get("agents", "")
-        if isinstance(agents_str, list):
-            agents_str = json.dumps(agents_str)
-        agents_str = str(agents_str).strip()
-        agent_entries = parse_agents_field(agents_str)
-        if not agent_entries:
-            single_agent = str_field(body.get("agent", "")).strip() or DEFAULT_AGENT
-            agent_entries = [{"agent": single_agent, "model": ""}]
 
-        # Validate agents
-        agent_entries = [
-            e for e in agent_entries if e["agent"] in VALID_AGENTS
-        ]
-        if not agent_entries:
-            agent_entries = [{"agent": DEFAULT_AGENT, "model": ""}]
-
-        if mode == "single":
-            agent_entries = agent_entries[:1]
-        else:
-            seen_a: set[tuple] = set()
-            agent_entries = [e for e in agent_entries if not ((e["agent"], e.get("model", ""), e.get("effort", "")) in seen_a or seen_a.add((e["agent"], e.get("model", ""), e.get("effort", ""))))]
-
-        model = str_field(body.get("model", "")).strip()
-        effort = str_field(body.get("effort", "")).strip()
         paused = bool(body.get("paused", False))
-        default_enabled_skills = normalize_enabled_skills(
-            body.get("enabled_skills"),
-            default=normalize_enabled_skills(load_settings().get("enabled_skills")),
-        )
+
         challenges_cfg = body.get("challenges", [])
         if not isinstance(challenges_cfg, list):
             return JSONResponse({"error": "challenges must be a list"}, status_code=400)
@@ -4097,14 +3936,7 @@ async def bulk_upload(request: Request) -> JSONResponse:
                 str_field(cfg.get("flag_format", "")).strip()
                 or global_flag_format
             )
-            ch_enabled_skills = (
-                normalize_enabled_skills(
-                    cfg.get("enabled_skills"),
-                    default=default_enabled_skills,
-                )
-                if "enabled_skills" in cfg
-                else default_enabled_skills
-            )
+            ch_skill_policy = skill_policy_from_request(cfg, scope="challenge", parent=default_skill_policy)
 
             challenge_id = uuid.uuid4().hex[:12]
             challenge_dir = CHALLENGES_DIR / challenge_id
@@ -4142,8 +3974,8 @@ async def bulk_upload(request: Request) -> JSONResponse:
             for entry in agent_entries:
                 agent_name = entry["agent"]
                 run_id = uuid.uuid4().hex[:8]
-                run_model = entry.get("model") or model or resolved_default_model(agent_name)
-                run_effort = normalize_effort_for_agent(agent_name, entry.get("effort") or effort)
+                run_model = entry["model"]
+                run_effort = entry["effort"]
                 run = make_run(
                     run_id=run_id,
                     agent=agent_name,
@@ -4168,7 +4000,7 @@ async def bulk_upload(request: Request) -> JSONResponse:
                 "status": challenge_status,
                 "created_at": datetime.now().isoformat(),
                 "files": file_names,
-                "enabled_skills": ch_enabled_skills,
+                **ch_skill_policy,
                 "error": None,
                 "runs": runs,
             }
@@ -4199,9 +4031,8 @@ async def bulk_upload(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def solve_challenge(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -4213,6 +4044,15 @@ async def solve_challenge(request: Request) -> JSONResponse:
 
     target_run_id = request.query_params.get("run_id")
     resume = request.query_params.get("resume") == "1"
+
+    targets = {target_run_id: challenge["runs"].get(target_run_id)} if target_run_id else challenge["runs"]
+    if any(run is None for run in targets.values()):
+        return JSONResponse({"error": "run not found"}, status_code=404)
+    try:
+        for run in targets.values():
+            await prepare_gateway_run(challenge, run)
+    except GatewayError as exc:
+        return gateway_error_response(exc)
 
     def _start_run(run_id: str, run: dict):
         if resume:
@@ -4258,9 +4098,8 @@ async def solve_challenge(request: Request) -> JSONResponse:
 
 
 async def stop_challenge(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -4318,9 +4157,8 @@ async def stop_challenge(request: Request) -> JSONResponse:
 
 
 async def get_challenge_prompt_template(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -4343,9 +4181,8 @@ async def get_challenge_prompt_template(request: Request) -> JSONResponse:
 
 
 async def add_challenge_runs(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -4362,52 +4199,23 @@ async def add_challenge_runs(request: Request) -> JSONResponse:
     if json_err:
         return json_err
 
-    agents_value = body.get("agents", "")
-    agents_str = (
-        json.dumps(agents_value)
-        if isinstance(agents_value, list)
-        else str_field(agents_value).strip()
-    )
-    agent_entries = parse_agents_field(agents_str)
-    if not agent_entries:
-        single_agent = str_field(body.get("agent", "")).strip() or DEFAULT_AGENT
-        agent_entries = [{
-            "agent": single_agent,
-            "model": str_field(body.get("model", "")),
-            "effort": str_field(body.get("effort", "")),
-        }]
-
-    valid_entries = []
-    seen: set[tuple[str, str, str]] = set()
-    for entry in agent_entries:
-        agent_name = entry.get("agent", "")
-        if agent_name not in VALID_AGENTS:
-            return JSONResponse(
-                {"error": f"invalid agent: {agent_name}"},
-                status_code=400,
-            )
-        key = (
-            agent_name,
-            entry.get("model", ""),
-            entry.get("effort", ""),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        valid_entries.append(entry)
-
-    if not valid_entries:
-        return JSONResponse({"error": "agent required"}, status_code=400)
+    try:
+        valid_entries = await resolve_agent_entries(body)
+    except GatewayError as exc:
+        return gateway_error_response(exc)
+    try:
+        guard_gateway_swarm(challenge=challenge)
+    except GatewayError as exc:
+        return gateway_error_response(exc)
 
     custom_prompt = str_field(body.get("prompt", "")).strip()
     custom_prompt_mode = str_field(body.get("prompt_mode", "")).strip()
     if custom_prompt_mode not in {"full", "append"}:
         custom_prompt_mode = "append"
-    has_skill_override = "enabled_skills" in body
-    enabled_skills = normalize_enabled_skills(
-        body.get("enabled_skills"),
-        default=[],
-    ) if has_skill_override else []
+    try:
+        skill_policy = skill_policy_from_request(body, scope="run")
+    except GatewayError as exc:
+        return gateway_error_response(exc)
 
     new_total = len(challenge.get("runs", {})) + len(valid_entries)
     if new_total > 1:
@@ -4420,15 +4228,8 @@ async def add_challenge_runs(request: Request) -> JSONResponse:
     for entry in valid_entries:
         agent_name = entry["agent"]
         run_id = uuid.uuid4().hex[:8]
-        run_model = (
-            entry.get("model")
-            or str_field(body.get("model", ""))
-            or resolved_default_model(agent_name)
-        )
-        run_effort = normalize_effort_for_agent(
-            agent_name,
-            entry.get("effort") or str_field(body.get("effort", "")),
-        )
+        run_model = entry["model"]
+        run_effort = entry["effort"]
         run = make_run(
             run_id=run_id,
             agent=agent_name,
@@ -4439,8 +4240,7 @@ async def add_challenge_runs(request: Request) -> JSONResponse:
         if custom_prompt:
             run["custom_prompt"] = custom_prompt
             run["custom_prompt_mode"] = custom_prompt_mode
-        if has_skill_override:
-            run["enabled_skills"] = enabled_skills
+        run.update(skill_policy)
         challenge["runs"][run_id] = run
         setup_run_dir(challenge_id, run_id)
         added_run_ids.append(run_id)
@@ -4491,9 +4291,8 @@ async def add_challenge_runs(request: Request) -> JSONResponse:
 
 async def broadcast_to_agents(request: Request) -> JSONResponse:
     """Broadcast a user message to all active runs as a breakthrough."""
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -4536,6 +4335,7 @@ async def _steer_run_with_message(
     stop_reason: str = "steer",
 ) -> None:
     """Stop a run immediately and resume it with a continuation message."""
+    await prepare_gateway_run(challenges[challenge_id], run)
     await stop_run(run, stop_reason)
     finish_run_timer(run)
 
@@ -4601,9 +4401,8 @@ async def _start_run_after_skill_change(
 
 
 async def steer_challenge(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -4646,14 +4445,10 @@ async def steer_challenge(request: Request) -> JSONResponse:
             return JSONResponse(
                 {"error": "no run to steer"}, status_code=404
             )
-
-    await _steer_run_with_message(
-        challenge_id,
-        target_run_id,
-        run,
-        message,
-    )
-
+    try:
+        await _steer_run_with_message(challenge_id, target_run_id, run, message)
+    except GatewayError as exc:
+        return gateway_error_response(exc)
     challenge["status"] = derive_challenge_status(challenge)
     save_metadata(challenge)
     return JSONResponse({"status": challenge["status"]})
@@ -4661,9 +4456,8 @@ async def steer_challenge(request: Request) -> JSONResponse:
 
 async def unsolve_challenge(request: Request) -> JSONResponse:
     """Set solved run(s) back to failed so user can retry."""
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -4704,9 +4498,8 @@ async def mark_solved(request: Request) -> JSONResponse:
     Only call this when a flag is confirmed correct — either via
     auto-submit to the platform or by the user confirming manually.
     """
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -4809,35 +4602,71 @@ async def mark_solved(request: Request) -> JSONResponse:
     })
 
 
-async def delete_challenge(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
-        return err
-
-    challenge_id = request.path_params["id"]
+async def _delete_single_challenge(challenge_id: str) -> bool:
+    """Stop runs and delete on-disk workspace and state for a challenge."""
     challenge = challenges.get(challenge_id)
     if not challenge:
-        return JSONResponse({"error": "not found"}, status_code=404)
+        return False
 
-    # Mark deleted so finalizers become no-ops
     challenge["_deleted"] = True
+    for run in list(challenge.get("runs", {}).values()):
+        try:
+            await stop_run(run, "deleted")
+        except Exception as exc:
+            log.warning("Failed to stop run %s while deleting challenge %s: %s", run.get("id"), challenge_id, exc)
 
-    # Stop all runs
-    for run in challenge["runs"].values():
-        await stop_run(run, "deleted")
-
-    # Free any swarm worker pinned to this challenge.
     release_swarm_from_challenge(challenge)
 
     challenge_dir = CHALLENGES_DIR / challenge_id
     if challenge_dir.exists():
-        shutil.rmtree(challenge_dir)
+        shutil.rmtree(challenge_dir, ignore_errors=True)
     shutil.rmtree(challenge_state_dir(challenge_id), ignore_errors=True)
 
-    del challenges[challenge_id]
+    challenges.pop(challenge_id, None)
+    return True
+
+
+async def delete_challenge(request: Request) -> JSONResponse:
+    if err := require_same_origin(request):
+        return err
+
+    challenge_id = request.path_params["id"]
+    if not await _delete_single_challenge(challenge_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    await broadcast_global({"type": "challenge_deleted", "challenge_id": challenge_id})
     return JSONResponse({"ok": True})
 
+
+async def delete_challenges_bulk(request: Request) -> JSONResponse:
+    """Delete multiple challenges or clear all challenges in one request."""
+    if err := require_same_origin(request):
+        return err
+
+    body, _ = await read_json_object(request)
+    all_flag = bool(body.get("all") or request.query_params.get("all") in ("1", "true", "yes"))
+    requested_ids = body.get("ids")
+    if not all_flag and not requested_ids:
+        return JSONResponse({"error": "No challenges specified to delete"}, status_code=400)
+
+    if all_flag:
+        target_ids = list(challenges.keys())
+    else:
+        if not isinstance(requested_ids, list):
+            return JSONResponse({"error": "ids must be a list"}, status_code=400)
+        target_ids = [str(cid) for cid in requested_ids if str(cid) in challenges]
+
+    deleted_ids = []
+    for cid in target_ids:
+        if await _delete_single_challenge(cid):
+            deleted_ids.append(cid)
+
+    await broadcast_global({
+        "type": "challenges_bulk_deleted",
+        "deleted_ids": deleted_ids,
+        "all": all_flag,
+    })
+    return JSONResponse({"ok": True, "deleted": deleted_ids, "count": len(deleted_ids)})
 
 # ---------------------------------------------------------------------------
 # File viewer
@@ -5037,8 +4866,7 @@ def _render_file_payload(name: str, data: bytes, total: int) -> dict:
 
 
 async def list_files(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
+    
 
     challenge_id = request.path_params["id"]
     if challenge_id not in challenges:
@@ -5169,8 +4997,7 @@ async def list_files(request: Request) -> JSONResponse:
 
 
 async def get_file(request: Request) -> Response:
-    if err := require_auth(request):
-        return err
+    
 
     challenge_id = request.path_params["id"]
     if challenge_id not in challenges:
@@ -5268,8 +5095,7 @@ async def get_file(request: Request) -> Response:
 
 
 async def download_file(request: Request) -> Response:
-    if err := require_auth(request):
-        return err
+    
 
     challenge_id = request.path_params["id"]
     if challenge_id not in challenges:
@@ -5874,6 +5700,7 @@ def _export_challenge_to_zip(
         "status": challenge["status"],
         "created_at": challenge["created_at"],
         "enabled_skills": challenge_enabled_skills(challenge),
+        "skills_mode": challenge_skills_mode(challenge),
         "detected_flags": challenge.get("detected_flags", {}),
         "detected_flag_meta": challenge.get("detected_flag_meta", {}),
         "flag_questions": challenge.get("_flag_questions", []),
@@ -5893,6 +5720,7 @@ def _export_challenge_to_zip(
             "duration_ms": effective_run_duration_ms(run),
             "notes_label": run.get("notes_label", ""),
             "enabled_skills": run_enabled_skills(challenge, run),
+            "skills_mode": skills_mode(run, scope="run"),
             "skill_override": run_has_skill_override(run),
             "custom_prompt": run.get("custom_prompt", ""),
             "custom_prompt_mode": run.get("custom_prompt_mode", "append"),
@@ -6175,8 +6003,7 @@ def _export_options_from_body(body: dict) -> tuple[bool, bool]:
 
 
 async def export_challenge(request: Request) -> Response:
-    if err := require_auth(request):
-        return err
+    
 
     challenge_id = request.path_params["id"]
     challenge = challenges.get(challenge_id)
@@ -6203,8 +6030,7 @@ async def export_challenge(request: Request) -> Response:
 
 
 async def export_challenges_bulk(request: Request) -> Response:
-    if err := require_auth(request):
-        return err
+    
 
     body, json_err = await read_json_object(request)
     if json_err:
@@ -6528,6 +6354,20 @@ def build_add_run_prompt_template(
         remote_placeholder=True,
         has_challenge_files=bool(challenge.get("files")),
     )
+
+
+def load_instruction_prompt() -> str:
+    """Load session instruction prompt from instruction.txt if present."""
+    for root in (APP_ROOT_DIR, REPO_ROOT_DIR, Path.cwd()):
+        path = root / "instruction.txt"
+        try:
+            if path.is_file():
+                text = path.read_text(encoding="utf-8", errors="replace").strip()
+                if text:
+                    return text
+        except OSError:
+            pass
+    return ""
 
 
 def build_prompt(challenge: dict, run: dict, instance_info: dict | None = None) -> str:
@@ -6939,9 +6779,14 @@ async def _run_agent_sdk_path(
     prompt: str,
     is_continue: bool,
     codex_skill_mentions: list[str] | None = None,
+    is_instruction_turn: bool = False,
 ) -> None:
     """Run an agent using the provider's SDK (no subprocess)."""
+    gateway = await prepare_gateway_run(challenge, run)
+    gateway_models = [row["id"] for row in await model_gateway.catalog()]
     run_cwd = get_run_cwd(challenge_id, run)
+    resources = await prepare_runtime_resources(challenge, run, run_cwd)
+    await _append_run_event(challenge_id, run_id, run, resources)
     session_state = run.setdefault("_session_state", {})
 
     log.info(
@@ -6967,35 +6812,20 @@ async def _run_agent_sdk_path(
         challenge_id[:8], run_id[:8], run["agent"], run.get("model", ""),
         run.get("effort", ""), run_cwd, is_continue,
     )
-    swarm_ip = _resolve_swarm_ip(challenge)
-    if swarm_ip:
-        try:
-            from .swarm_exec import remote_run_agent
-        except ImportError:
-            from swarm_exec import remote_run_agent
-        log.info(
-            "[%s/%s] Dispatching to swarm worker %s (%s)",
-            challenge_id[:8], run_id[:8], challenge.get("_swarm_instance"), swarm_ip,
-        )
-        event_source = remote_run_agent(
-            challenge, run, prompt, is_continue, swarm_ip,
-            env=agent_runtime_env(run["agent"]),
-            codex_skill_mentions=codex_skill_mentions or [],
-        )
-    else:
-        event_source = provider.run_agent(
-            prompt=prompt,
-            model=run.get("model", ""),
-            effort=run.get("effort", ""),
-            cwd=str(run_cwd),
-            continue_session=is_continue,
-            session_state=session_state,
-            challenge_id=challenge_id if is_parallel else "",
-            run_id=run_id if is_parallel else "",
-            _codex_skill_mentions=codex_skill_mentions or [],
-            _env=agent_runtime_env(run["agent"]),
-            _run=run,
-        )
+    event_source = provider.run_agent(
+        prompt=prompt,
+        model=run.get("model", ""),
+        effort=run.get("effort", ""),
+        cwd=str(run_cwd),
+        continue_session=is_continue,
+        session_state=session_state,
+        challenge_id=challenge_id if is_parallel else "",
+        run_id=run_id if is_parallel else "",
+        _codex_skill_mentions=codex_skill_mentions or [],
+        _gateway=gateway,
+        _gateway_models=gateway_models,
+        _run=run,
+    )
     try:
         async for event in event_source:
             # Check if we've been stopped externally
@@ -7047,9 +6877,10 @@ async def _run_agent_sdk_path(
                     challenge_id, run_id, event, challenge, event_index
                 )
             if etype == "result" and provider.name == "claude":
-                await _mark_run_completed_from_result(
-                    challenge_id, run_id, challenge, run, event
-                )
+                if not is_instruction_turn:
+                    await _mark_run_completed_from_result(
+                        challenge_id, run_id, challenge, run, event
+                    )
                 break
 
     except asyncio.CancelledError:
@@ -7080,6 +6911,16 @@ async def _run_agent_sdk_path(
             unregister_run(challenge_id, run_id)
 
     # --- Finalization ---
+    if is_instruction_turn:
+        stop_reason = run.pop("_stop_reason", None)
+        if stop_reason:
+            run["status"] = "failed"
+        elif last_error:
+            run["status"] = "failed"
+            run["error"] = last_error
+        save_metadata(challenge)
+        return
+
     try:
         stop_reason = run.pop("_stop_reason", None)
 
@@ -7392,6 +7233,11 @@ async def run_agent_task(
     """Run an agent for a specific run of a challenge."""
     challenge = challenges[challenge_id]
     run = challenge["runs"][run_id]
+    try:
+        gateway = await prepare_gateway_run(challenge, run)
+    except GatewayError as exc:
+        await _fail_run_before_agent(challenge_id, run_id, challenge, run, exc.public_message)
+        return
     run_cwd = get_run_cwd(challenge_id, run)
     sync_run_skill_links(challenge, run)
     seed_working_notes(challenge_id, run)
@@ -7427,6 +7273,91 @@ async def run_agent_task(
         session_state_for_prompt.get("claude_session_id")
         or session_state_for_prompt.get("codex_thread_id")
     )
+
+    instruction_prompt = (
+        load_instruction_prompt()
+        if not continue_msg and not has_session
+        else ""
+    )
+
+    if instruction_prompt:
+        sys_event = {
+            "type": "system",
+            "message": f"{provider.label} agent initializing...",
+        }
+        await _append_run_event(challenge_id, run_id, run, sys_event)
+        model_info = run.get('model', '')
+        if run.get('effort'):
+            model_info += f", {run['effort']}"
+        await discord_notify(challenge, f"**{run['agent']}** ({model_info}) — {sys_event['message']}")
+
+        prompt_event = {"type": "user_prompt", "message": instruction_prompt}
+        if run.get("solve_start"):
+            prompt_event["ts"] = run_elapsed_seconds(run)
+        await _append_run_event(challenge_id, run_id, run, prompt_event)
+
+        if provider.supports_sdk:
+            log.info("[%s/%s] Running initial instruction turn via SDK for %s", challenge_id[:8], run_id[:8], run["agent"])
+            await _run_agent_sdk_path(
+                challenge_id, run_id, challenge, run, provider,
+                instruction_prompt, is_continue=False,
+                codex_skill_mentions=codex_skill_mentions,
+                is_instruction_turn=True,
+            )
+
+            if run.get("_stop_reason") or run.get("status") in ("failed", "solved"):
+                return
+
+            # Re-arm run for solve prompt in the same session
+            run["status"] = "solving"
+            run["error"] = None
+            start_run_timer(run, reset=False)
+            save_metadata(challenge)
+            await broadcast_challenge(challenge_id, {
+                "type": "challenge_status",
+                "status": challenge["status"],
+            })
+            await broadcast(challenge_id, run_id, {
+                "type": "run_status",
+                "run_id": run_id,
+                "status": "solving",
+            })
+
+            solve_prompt = build_prompt(challenge, run, instance_info)
+            prompt_event2 = {"type": "user_prompt", "message": solve_prompt}
+            if run.get("solve_start"):
+                prompt_event2["ts"] = run_elapsed_seconds(run)
+            await _append_run_event(challenge_id, run_id, run, prompt_event2)
+
+            log.info("[%s/%s] Running solve turn via SDK for %s", challenge_id[:8], run_id[:8], run["agent"])
+            try:
+                await _run_agent_sdk_path(
+                    challenge_id, run_id, challenge, run, provider,
+                    solve_prompt, is_continue=True,
+                    codex_skill_mentions=codex_skill_mentions,
+                    is_instruction_turn=False,
+                )
+            except Exception as exc:
+                log.error("[%s/%s] SDK path CRASHED: %s", challenge_id[:8], run_id[:8], exc, exc_info=True)
+                if run["status"] == "solving":
+                    run["status"] = "failed"
+                    run["error"] = str(exc)
+                finish_run_timer(run)
+                challenge["status"] = derive_challenge_status(challenge)
+                save_metadata(challenge)
+                err_event = {"type": "error", "message": f"SDK error: {exc}"}
+                await _append_run_event(challenge_id, run_id, run, err_event)
+                await broadcast(challenge_id, run_id, {
+                    "type": "run_status", "run_id": run_id,
+                    "status": run["status"], "error": run.get("error"),
+                    "duration_ms": effective_run_duration_ms(run),
+                })
+                await broadcast_challenge(challenge_id, {
+                    "type": "challenge_status",
+                    "status": challenge["status"],
+                })
+            log.info("[%s/%s] SDK path completed for %s", challenge_id[:8], run_id[:8], run["agent"])
+            return
 
     if continue_msg and has_session:
         sys_event = {
@@ -7491,9 +7422,11 @@ async def run_agent_task(
         return
 
     # --- CLI fallback path ---
+    resources = await prepare_runtime_resources(challenge, run, run_cwd)
+    await _append_run_event(challenge_id, run_id, run, resources)
     env = os.environ.copy()
     env["IS_SANDBOX"] = "1"
-    env.update(agent_runtime_env(run["agent"]))
+    env.update(gateway_child_env(gateway, run["agent"]))
 
     # Build command using run data instead of challenge data
     # We pass a dict that looks like the old challenge format for provider compatibility
@@ -7508,6 +7441,20 @@ async def run_agent_task(
         "_codex_thread_id": run.get("_codex_thread_id"),
     }
     cmd = provider.build_command(compat_dict, prompt, bool(continue_msg))
+    if run["agent"] == "codex":
+        try:
+            from .agents.codex import codex_gateway_launch
+        except ImportError:
+            from agents.codex import codex_gateway_launch
+        cmd, env = codex_gateway_launch(gateway, cmd[1:], cwd=run_cwd)
+    else:
+        cmd[0] = gateway.config.claude_cli
+        try:
+            from .agents.claude import claude_workspace_cli_args
+        except ImportError:
+            from agents.claude import claude_workspace_cli_args
+        cmd += claude_workspace_cli_args(run_cwd)
+        cmd += ["--settings", json.dumps({"model": gateway.model, "availableModels": [row["id"] for row in await model_gateway.catalog()], "env": {key: value for key, value in gateway_child_env(gateway, run["agent"]).items() if key != "ANTHROPIC_AUTH_TOKEN"}})]
 
     log.info(
         "[%s/%s] Starting %s: %s (continue=%s, cwd=%s)",
@@ -7759,11 +7706,7 @@ async def challenge_ws(websocket: WebSocket):
     if not websocket_origin_allowed(websocket):
         await websocket.close(code=4003)
         return
-    if not websocket.session.get("authenticated"):
-        auth = websocket.headers.get("authorization", "")
-        if not _check_basic_auth(auth):
-            await websocket.close(code=4001)
-            return
+    
 
     challenge_id = websocket.path_params["id"]
     run_id = websocket.path_params["run_id"]
@@ -7831,11 +7774,7 @@ async def global_events_ws(websocket: WebSocket):
     if not websocket_origin_allowed(websocket):
         await websocket.close(code=4003)
         return
-    if not websocket.session.get("authenticated"):
-        auth = websocket.headers.get("authorization", "")
-        if not _check_basic_auth(auth):
-            await websocket.close(code=4001)
-            return
+    
     await websocket.accept()
     _global_ws_clients.add(websocket)
     try:
@@ -7848,460 +7787,33 @@ async def global_events_ws(websocket: WebSocket):
 
 
 # ---------------------------------------------------------------------------
-# Agent Auth Sessions
-# ---------------------------------------------------------------------------
-
-def _prune_agent_auth_sessions() -> None:
-    now = _time.monotonic()
-    expired = [
-        session_id
-        for session_id, session in _agent_auth_sessions.items()
-        if now - float(session.get("created_at", 0)) > AUTH_SESSION_TTL_SECONDS
-    ]
-    for session_id in expired:
-        session = _agent_auth_sessions.pop(session_id, None)
-        proc = session.get("process") if isinstance(session, dict) else None
-        if isinstance(proc, subprocess.Popen) and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except Exception:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-
-
-def _agent_auth_command(agent: str, method: str = "default") -> tuple[str, ...] | None:
-    commands = AUTH_COMMANDS.get(agent)
-    if not commands:
-        return None
-    return commands.get(method) or commands.get("default")
-
-
-def _agent_auth_status_command(agent: str) -> tuple[str, ...] | None:
-    return AUTH_STATUS_COMMANDS.get(agent)
-
-
-def _run_auth_status_command(agent: str) -> dict:
-    command = _agent_auth_status_command(agent)
-    login_command = _agent_auth_command(agent)
-    env_auth = public_agent_env_auth(agent)
-    result: dict = {
-        "agent": agent,
-        "available": False,
-        "connected": False,
-        "command": " ".join(login_command or ()),
-        "env_auth": env_auth,
-        "rows": [],
-    }
-    if not command:
-        result["error"] = "Unsupported agent"
-        return result
-    if not shutil.which(command[0]):
-        result["error"] = f"{command[0]} is not installed"
-        return result
-
-    result["available"] = True
-    if agent == "claude" and env_auth.get("configured"):
-        source = env_auth.get("source")
-        source_label = "Process env vars" if source == "process" else "Saved env vars"
-        rows = [
-            {"label": "Method", "value": source_label},
-            {"label": "Token", "value": "ANTHROPIC_AUTH_TOKEN configured"},
-        ]
-        if env_auth.get("base_url"):
-            rows.append({
-                "label": "Base URL",
-                "value": str(env_auth["base_url"]),
-            })
-        result["connected"] = True
-        result["rows"] = rows
-        return result
-
-    env = os.environ.copy()
-    env.update(agent_runtime_env(agent))
-    try:
-        completed = subprocess.run(
-            list(command),
-            cwd=str(APP_ROOT_DIR),
-            text=True,
-            capture_output=True,
-            timeout=AUTH_STATUS_TIMEOUT_SECONDS,
-            check=False,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        result["error"] = "Auth status timed out"
-        return result
-    except Exception as exc:
-        result["error"] = str(exc)
-        return result
-
-    stdout = (completed.stdout or "").strip()
-    stderr = (completed.stderr or "").strip()
-    text = stdout or stderr
-    if agent == "claude":
-        try:
-            payload = json.loads(stdout or "{}")
-        except json.JSONDecodeError:
-            payload = {}
-        connected = bool(payload.get("loggedIn"))
-        result["connected"] = connected
-        rows = []
-        if payload.get("email"):
-            rows.append({"label": "Account", "value": str(payload["email"])})
-        if payload.get("authMethod"):
-            rows.append({"label": "Method", "value": str(payload["authMethod"])})
-        if payload.get("subscriptionType"):
-            rows.append({"label": "Plan", "value": str(payload["subscriptionType"])})
-        if payload.get("orgName"):
-            rows.append({"label": "Org", "value": str(payload["orgName"])})
-        result["rows"] = rows
-        if not connected and text:
-            result["error"] = text[:300]
-        return result
-
-    if agent == "codex":
-        text_l = text.casefold()
-        connected = (
-            completed.returncode == 0
-            and "not logged in" not in text_l
-            and ("logged in" in text_l or "authenticated" in text_l)
-        )
-        result["connected"] = connected
-        rows = []
-        if text:
-            method = re.sub(r"^logged in using\s+", "", text, flags=re.IGNORECASE)
-            rows.append({
-                "label": "Method" if connected else "Status",
-                "value": method[:160],
-            })
-        result["rows"] = rows
-        if not connected and text:
-            result["error"] = text[:300]
-        return result
-
-    result["error"] = text[:300] if text else "Unknown auth status"
-    return result
-
-
-async def agent_auth_status(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-
-    async def _one(agent: str) -> tuple[str, dict]:
-        return agent, await asyncio.to_thread(_run_auth_status_command, agent)
-
-    pairs = await asyncio.gather(*(_one(agent) for agent in PROVIDERS))
-    return JSONResponse({"agents": dict(pairs)})
-
-
-async def start_agent_auth(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
-        return err
-    body, json_err = await read_json_object(request)
-    if json_err:
-        return json_err
-
-    agent = str_field(body.get("agent", "")).strip()
-    method = str_field(body.get("method", "default")).strip() or "default"
-    if agent not in PROVIDERS:
-        return JSONResponse({"error": f"Unknown agent: {agent}"}, status_code=400)
-
-    command = _agent_auth_command(agent, method)
-    if not command:
-        return JSONResponse(
-            {"error": f"No auth command configured for {agent}"},
-            status_code=400,
-        )
-    if not shutil.which(command[0]):
-        return JSONResponse(
-            {"error": f"{command[0]} is not installed"},
-            status_code=400,
-        )
-
-    _prune_agent_auth_sessions()
-    session_id = secrets.token_urlsafe(24)
-    _agent_auth_sessions[session_id] = {
-        "id": session_id,
-        "agent": agent,
-        "method": method,
-        "command": list(command),
-        "created_at": _time.monotonic(),
-        "started": False,
-    }
-    return JSONResponse({
-        "session_id": session_id,
-        "agent": agent,
-        "command": " ".join(command),
-    })
-
-
-async def set_agent_env_auth(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
-        return err
-    body, json_err = await read_json_object(request)
-    if json_err:
-        return json_err
-
-    agent = str_field(body.get("agent", "")).strip()
-    if agent != "claude":
-        return JSONResponse(
-            {"error": "Environment auth is only supported for Claude"},
-            status_code=400,
-        )
-
-    data = load_agent_env_auth()
-    current = data.get(agent) if isinstance(data.get(agent), dict) else {}
-    if body.get("clear"):
-        data.pop(agent, None)
-        save_agent_env_auth(data)
-        return JSONResponse({
-            "ok": True,
-            "agent": agent,
-            "status": _run_auth_status_command(agent),
-        })
-
-    base_url = str_field(body.get("base_url", "")).strip()
-    auth_token = str_field(body.get("auth_token", "")).strip()
-    existing_token = str_field(current.get("ANTHROPIC_AUTH_TOKEN", "")).strip()
-    process_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
-    if not auth_token and not existing_token and not process_token:
-        return JSONResponse(
-            {"error": "ANTHROPIC_AUTH_TOKEN is required"},
-            status_code=400,
-        )
-
-    entry = dict(current)
-    if base_url:
-        entry["ANTHROPIC_BASE_URL"] = base_url
-    else:
-        entry.pop("ANTHROPIC_BASE_URL", None)
-    if auth_token:
-        entry["ANTHROPIC_AUTH_TOKEN"] = auth_token
-
-    if entry:
-        data[agent] = entry
-    else:
-        data.pop(agent, None)
-    save_agent_env_auth(data)
-    return JSONResponse({
-        "ok": True,
-        "agent": agent,
-        "status": _run_auth_status_command(agent),
-    })
-
-
-async def _pty_read_once(fd: int) -> bytes:
-    loop = asyncio.get_running_loop()
-    ready = loop.create_future()
-
-    def _mark_ready() -> None:
-        if not ready.done():
-            ready.set_result(None)
-
-    loop.add_reader(fd, _mark_ready)
-    try:
-        await ready
-        return os.read(fd, 4096)
-    finally:
-        try:
-            loop.remove_reader(fd)
-        except Exception:
-            pass
-
-
-async def _agent_auth_output_loop(websocket: WebSocket, master_fd: int) -> None:
-    while True:
-        try:
-            chunk = await _pty_read_once(master_fd)
-        except OSError:
-            break
-        if not chunk:
-            break
-        await websocket.send_json({
-            "type": "output",
-            "data": chunk.decode("utf-8", errors="replace"),
-        })
-
-
-async def _agent_auth_input_loop(
-    websocket: WebSocket,
-    master_fd: int,
-    proc: subprocess.Popen,
-) -> str:
-    while proc.poll() is None:
-        try:
-            raw = await websocket.receive_text()
-        except WebSocketDisconnect:
-            return "disconnect"
-        try:
-            message = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(message, dict):
-            continue
-        msg_type = str(message.get("type", ""))
-        if msg_type == "cancel":
-            return "cancel"
-        if msg_type == "input":
-            data = str(message.get("data", ""))
-            if data:
-                try:
-                    os.write(master_fd, data.encode("utf-8", errors="replace"))
-                except OSError:
-                    return "closed"
-    return "exited"
-
-
-async def _terminate_auth_process(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except Exception:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-    try:
-        await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=5)
-    except asyncio.TimeoutError:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        await asyncio.to_thread(proc.wait)
-
-
-async def agent_auth_ws(websocket: WebSocket):
-    if not websocket_origin_allowed(websocket):
-        await websocket.close(code=4003)
-        return
-    if not websocket.session.get("authenticated"):
-        auth = websocket.headers.get("authorization", "")
-        if not _check_basic_auth(auth):
-            await websocket.close(code=4001)
-            return
-
-    _prune_agent_auth_sessions()
-    session_id = websocket.path_params["session_id"]
-    session = _agent_auth_sessions.get(session_id)
-    if not session:
-        await websocket.close(code=4004)
-        return
-    if session.get("started"):
-        await websocket.close(code=4009)
-        return
-    session["started"] = True
-
-    await websocket.accept()
-    command = [str(part) for part in session.get("command", [])]
-    master_fd = -1
-    proc: subprocess.Popen | None = None
-    output_task: asyncio.Task | None = None
-    input_task: asyncio.Task | None = None
-    wait_task: asyncio.Task | None = None
-    try:
-        await websocket.send_json({
-            "type": "start",
-            "agent": session.get("agent", ""),
-            "command": " ".join(command),
-        })
-        master_fd, slave_fd = pty.openpty()
-        env = os.environ.copy()
-        env.setdefault("TERM", "xterm-256color")
-        try:
-            proc = subprocess.Popen(
-                command,
-                cwd=str(APP_ROOT_DIR),
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                close_fds=True,
-                start_new_session=True,
-                env=env,
-            )
-        finally:
-            os.close(slave_fd)
-        session["process"] = proc
-
-        output_task = asyncio.create_task(
-            _agent_auth_output_loop(websocket, master_fd)
-        )
-        input_task = asyncio.create_task(
-            _agent_auth_input_loop(websocket, master_fd, proc)
-        )
-        wait_task = asyncio.create_task(asyncio.to_thread(proc.wait))
-        done, _pending = await asyncio.wait(
-            {input_task, wait_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        reason = ""
-        if input_task in done:
-            reason = input_task.result()
-            if reason in {"cancel", "disconnect", "closed"}:
-                await _terminate_auth_process(proc)
-        returncode = await wait_task
-        if output_task and not output_task.done():
-            try:
-                await asyncio.wait_for(output_task, timeout=0.5)
-            except asyncio.TimeoutError:
-                output_task.cancel()
-        if reason != "disconnect":
-            await websocket.send_json({
-                "type": "exit",
-                "returncode": returncode,
-                "cancelled": reason == "cancel",
-            })
-    except WebSocketDisconnect:
-        if proc:
-            await _terminate_auth_process(proc)
-    except Exception as exc:
-        log.error("Agent auth session failed: %s", exc, exc_info=True)
-        try:
-            await websocket.send_json({"type": "error", "message": str(exc)})
-        except Exception:
-            pass
-    finally:
-        for task in (input_task, output_task):
-            if task and not task.done():
-                task.cancel()
-        if master_fd >= 0:
-            try:
-                os.close(master_fd)
-            except OSError:
-                pass
-        _agent_auth_sessions.pop(session_id, None)
-
-
-# ---------------------------------------------------------------------------
 # Settings / Agents / Usage
 # ---------------------------------------------------------------------------
 
 async def get_settings(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
+    
     return JSONResponse(settings_for_client(load_settings()))
 
 
 async def get_skills(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
+    
     return JSONResponse(public_skill_catalog())
 
 
-async def upload_skill(request: Request) -> JSONResponse:
-    if err := require_auth(request):
+async def get_resources(request: Request) -> JSONResponse:
+    if err := require_same_origin(request):
         return err
-    if err := require_csrf(request):
+    settings = load_settings()
+    return JSONResponse({"skills_mode": skills_mode(settings, scope="settings"),
+                         "skills_count": len(discover_skill_catalog()),
+                         "automatic_skills": default_enabled_skill_names(),
+                         "mcp": [await asyncio.to_thread(builtin_mcp_status, REPO_ROOT_DIR)],
+                         "category_catalog": dict(_category_catalog_status)})
+
+
+async def upload_skill(request: Request) -> JSONResponse:
+    
+    if err := require_same_origin(request):
         return err
 
     form = await request.form()
@@ -8362,9 +7874,8 @@ async def upload_skill(request: Request) -> JSONResponse:
 
 
 async def discord_test(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
     body, json_err = await read_json_object(request)
     if json_err:
@@ -8390,9 +7901,8 @@ async def discord_test(request: Request) -> JSONResponse:
 
 
 async def discord_channels(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
     body, json_err = await read_json_object(request)
     if json_err:
@@ -8747,6 +8257,7 @@ def assign_swarm_to_challenge(challenge: dict, requested: str) -> str:
     Returns the assigned instance name ('' if local / none available).
     """
     requested = (requested or "").strip()
+    guard_gateway_swarm(requested, challenge if requested not in ("", "local") else None)
     if not requested or requested == "local":
         challenge.pop("_swarm_instance", None)
         return ""
@@ -8785,8 +8296,7 @@ def release_swarm_from_challenge(challenge: dict) -> None:
 
 
 async def swarm_status(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
+    
     settings = load_settings()
     swarm_mod = _swarm_module()
     reg = swarm_mod.load_registry()
@@ -8809,9 +8319,8 @@ async def swarm_status(request: Request) -> JSONResponse:
 
 
 async def swarm_save_config(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
     body, json_err = await read_json_object(request)
     if json_err:
@@ -8879,9 +8388,8 @@ async def swarm_save_config(request: Request) -> JSONResponse:
 
 
 async def swarm_test(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
     settings = load_settings()
     swarm_mod = _swarm_module()
@@ -8907,9 +8415,8 @@ async def swarm_test(request: Request) -> JSONResponse:
 
 
 async def swarm_build_image(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
     settings = load_settings()
     swarm_mod = _swarm_module()
@@ -8942,9 +8449,8 @@ async def swarm_build_image(request: Request) -> JSONResponse:
 
 
 async def swarm_create_instances(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
     body, json_err = await read_json_object(request)
     if json_err:
@@ -9000,9 +8506,8 @@ async def swarm_create_instances(request: Request) -> JSONResponse:
 
 
 async def swarm_instance_action(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
     name = request.path_params["name"]
     action = request.path_params["action"]
@@ -9038,9 +8543,8 @@ async def swarm_instance_action(request: Request) -> JSONResponse:
 
 
 async def swarm_delete_instance(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
     name = request.path_params["name"]
     settings = load_settings()
@@ -9057,9 +8561,8 @@ async def swarm_delete_instance(request: Request) -> JSONResponse:
 
 
 async def swarm_refresh(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
     settings = load_settings()
     swarm_mod = _swarm_module()
@@ -9071,56 +8574,51 @@ async def swarm_refresh(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
 
-def _static_provider_metadata(provider) -> dict:
-    """Return provider metadata using static models only (no PTY discovery).
-
-    This avoids the 3-8 second PTY subprocess that some provider discovery
-    paths spawn. The static models list is always available and sufficient
-    for the UI.
-    """
-    return {
-        "name": provider.name,
-        "label": provider.label,
-        "models": [
-            {"value": value, "label": label}
-            for value, label in provider.models
-        ] if provider.models else [
-            {"value": "", "label": "Provider default"}
-        ],
-        "default_model": provider.default_model,
-        "auth_connect_command": provider.auth_connect_command,
-        "badge_mode": provider.badge_mode,
-        "effort_levels": [
-            {"value": value, "label": label}
-            for value, label in provider.effort_levels
-        ],
-        "default_effort": provider.default_effort,
-    }
+async def gateway_catalog_payload(*, force_refresh: bool = False) -> dict:
+    gateway = await model_gateway.public_status(force_refresh=force_refresh)
+    try:
+        models = await model_gateway.catalog() if gateway["status"] == "ready" else []
+    except GatewayError as exc:
+        models = []
+        gateway["status"], gateway["error"] = "error", exc.public_message
+        for harness in gateway["harnesses"].values():
+            harness["ready"] = False
+            if harness["available"]:
+                harness["error"] = exc.public_message
+    settings = await gateway_settings()
+    return {"agents": [gateway_agent_metadata(provider, models, settings) for provider in PROVIDERS.values()],
+            "parallel_option": {"value": PARALLEL_AGENT_VALUE, "label": "All (parallel)"} if len(PROVIDERS) > 1 else None,
+            "gateway": gateway}
 
 
 async def list_agents(request: Request) -> JSONResponse:
-    if err := require_auth(request):
+    
+    return JSONResponse(await gateway_catalog_payload(force_refresh=request.query_params.get("refresh") == "1"))
+
+
+async def get_gateway(request: Request) -> JSONResponse:
+    
+    return JSONResponse(await model_gateway.public_status(force_refresh=request.query_params.get("refresh") == "1"))
+
+
+async def update_gateway(request: Request) -> JSONResponse:
+    
+    if err := require_same_origin(request):
         return err
-    return JSONResponse({
-        "agents": [
-            _static_provider_metadata(provider)
-            for provider in PROVIDERS.values()
-        ],
-        "parallel_option": (
-            {
-                "value": PARALLEL_AGENT_VALUE,
-                "label": "All (parallel)",
-            }
-            if len(PROVIDERS) > 1
-            else None
-        ),
-    })
+    body, json_err = await read_json_object(request)
+    if json_err:
+        return json_err
+    try:
+        await model_gateway.configure({"base_url": str_field(body.get("base_url", "")), "api_key": str_field(body.get("api_key", ""))})
+    except GatewayError as exc:
+        return gateway_error_response(exc)
+    return JSONResponse(await model_gateway.public_status(force_refresh=True))
+
 
 
 async def update_settings(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
     body, json_err = await read_json_object(request)
     if json_err:
@@ -9160,29 +8658,26 @@ async def update_settings(request: Request) -> JSONResponse:
             settings["chat_view_mode"] = mode
     if "enabled_agents" in body:
         agents = body["enabled_agents"]
-        if isinstance(agents, list):
-            settings["enabled_agents"] = [
-                str_field(a) for a in agents if str_field(a) in VALID_AGENTS
-            ]
+        if not isinstance(agents, list) or not agents:
+            return JSONResponse({"error": "At least one agent is required"}, status_code=400)
+        if any(not isinstance(agent, str) or agent not in VALID_AGENTS for agent in agents):
+            return JSONResponse({"error": "invalid agent"}, status_code=400)
+        settings["enabled_agents"] = list(dict.fromkeys(agents))
     if "agent_models" in body:
         models = body["agent_models"]
         if isinstance(models, dict):
-            settings["agent_models"] = {
-                str_field(k): str_field(v) for k, v in models.items()
-                if str_field(k) in VALID_AGENTS
-            }
+            settings["agent_models"] = {**settings.get("agent_models", {}),
+                                        **{str_field(k): str_field(v) for k, v in models.items() if str_field(k) in VALID_AGENTS}}
     if "agent_efforts" in body:
         efforts = body["agent_efforts"]
         if isinstance(efforts, dict):
-            settings["agent_efforts"] = {
-                str_field(k): str_field(v) for k, v in efforts.items()
-                if str_field(k) in VALID_AGENTS
-            }
-    if "enabled_skills" in body:
-        settings["enabled_skills"] = normalize_enabled_skills(
-            body.get("enabled_skills"),
-            default=[],
-        )
+            settings["agent_efforts"] = {**settings.get("agent_efforts", {}),
+                                         **{str_field(k): str_field(v) for k, v in efforts.items() if str_field(k) in VALID_AGENTS}}
+    if "enabled_skills" in body or "skills_mode" in body:
+        try:
+            settings.update(skill_policy_from_request(body, scope="settings", parent=settings))
+        except GatewayError as exc:
+            return gateway_error_response(exc)
     if "enabled_hooks" in body:
         settings["enabled_hooks"] = normalize_enabled_hooks(
             body.get("enabled_hooks")
@@ -9203,6 +8698,22 @@ async def update_settings(request: Request) -> JSONResponse:
         settings["discord_challenge_layout"] = normalize_discord_challenge_layout(
             body["discord_challenge_layout"]
         )
+    if any(key in body for key in ("enabled_agents", "agent_models", "agent_efforts")):
+        enabled = settings.get("enabled_agents") or [settings.get("default_agent") or DEFAULT_AGENT]
+        rows = []
+        for agent in enabled:
+            row = {"agent": agent}
+            for field, mapping in (("model", "agent_models"), ("effort", "agent_efforts")):
+                if agent in settings.get(mapping, {}):
+                    row[field] = settings[mapping][agent]
+            rows.append(row)
+        try:
+            selections = await resolve_agent_entries({"agents": rows}, settings=settings)
+        except GatewayError as exc:
+            return gateway_error_response(exc)
+        for row in selections:
+            settings.setdefault("agent_models", {})[row["agent"]] = row["model"]
+            settings.setdefault("agent_efforts", {})[row["agent"]] = row["effort"]
     save_settings(settings)
     if discord_changed:
         asyncio.create_task(_reconcile_discord_gateway())
@@ -9239,30 +8750,9 @@ def get_agent_challenge_stats() -> dict:
 
 
 async def get_usage(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-
-    async def _collect_provider_usage(name: str, provider) -> tuple[str, dict | None]:
-        try:
-            return name, await asyncio.to_thread(provider.get_usage_data)
-        except Exception as exc:
-            log.warning("Failed to collect %s usage data: %s", name, exc)
-            return name, {
-                "auth_rows": [{"label": "Error", "value": str(exc)}],
-                "stat_rows": [],
-                "daily_activity": [],
-                "daily_activity_title": None,
-            }
-
-    usage_pairs = await asyncio.gather(*(
-        _collect_provider_usage(name, provider)
-        for name, provider in PROVIDERS.items()
-    ))
-    result = {
-        "agents": dict(usage_pairs),
-        "challenges": get_agent_challenge_stats(),
-    }
-    return JSONResponse(result)
+    
+    gateway = await model_gateway.public_status(force_refresh=request.query_params.get("refresh") == "1")
+    return JSONResponse({"gateway": gateway, "agents": gateway["harnesses"], "challenges": get_agent_challenge_stats()})
 
 
 # ---------------------------------------------------------------------------
@@ -9271,8 +8761,7 @@ async def get_usage(request: Request) -> JSONResponse:
 
 
 async def list_plugins(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
+    
     plugins = get_plugins()
     return JSONResponse([
         {
@@ -9295,9 +8784,8 @@ async def list_plugins(request: Request) -> JSONResponse:
 
 
 async def plugin_test_connection(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     body, json_err = await read_json_object(request)
@@ -9325,9 +8813,8 @@ async def plugin_test_connection(request: Request) -> JSONResponse:
 
 
 async def plugin_fetch_challenges(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     body, json_err = await read_json_object(request)
@@ -9390,8 +8877,7 @@ def _set_import_progress(progress_id: str, **fields) -> None:
 
 
 async def plugin_import_progress(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
+    
     progress_id = request.path_params["progress_id"]
     state = _platform_import_progress.get(progress_id)
     if not state:
@@ -9401,9 +8887,8 @@ async def plugin_import_progress(request: Request) -> JSONResponse:
 
 async def plugin_import_challenges(request: Request) -> JSONResponse:
     """Download files and create challenges from a plugin fetch."""
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     body, json_err = await read_json_object(request)
@@ -9419,19 +8904,17 @@ async def plugin_import_challenges(request: Request) -> JSONResponse:
     mode = str_field(body.get("mode", "single")).strip()
     if mode not in VALID_MODES:
         mode = "single"
-    agents_value = body.get("agents", "")
-    if isinstance(agents_value, list):
-        agents = json.dumps(agents_value)
-    else:
-        agents = str_field(agents_value).strip()
-    model = str_field(body.get("model", ""))
-    effort = str_field(body.get("effort", ""))
+    try:
+        agent_entries = await resolve_agent_entries(body, mode=mode)
+        default_skill_policy = skill_policy_from_request(body, scope="challenge")
+        for cfg in selected:
+            if isinstance(cfg, dict):
+                skill_policy_from_request(cfg, scope="challenge", parent=default_skill_policy)
+    except GatewayError as exc:
+        return gateway_error_response(exc)
     flag_format = str_field(body.get("flag_format", "")).strip()
     paused = bool(body.get("paused", False))
-    default_enabled_skills = normalize_enabled_skills(
-        body.get("enabled_skills"),
-        default=normalize_enabled_skills(load_settings().get("enabled_skills")),
-    )
+
     progress_id = str_field(body.get("progress_id", "")).strip()
     enabled_selected = [
         item for item in selected
@@ -9494,14 +8977,7 @@ async def plugin_import_challenges(request: Request) -> JSONResponse:
         if ch_category:
             ch_description = f"Challenge Category: {ch_category}\n\n{ch_description}" if ch_description else f"Challenge Category: {ch_category}"
         ch_flag_format = str_field(ch_cfg.get("flag_format", "")) or flag_format
-        ch_enabled_skills = (
-            normalize_enabled_skills(
-                ch_cfg.get("enabled_skills"),
-                default=default_enabled_skills,
-            )
-            if "enabled_skills" in ch_cfg
-            else default_enabled_skills
-        )
+        ch_skill_policy = skill_policy_from_request(ch_cfg, scope="challenge", parent=default_skill_policy)
         remote_files = ch_cfg.get("files", [])
         if not isinstance(remote_files, list):
             remote_files = []
@@ -9695,19 +9171,7 @@ async def plugin_import_challenges(request: Request) -> JSONResponse:
                 f"download: {'; '.join(download_errors)}"
             )
 
-        # Determine which agents to create runs for
-        agent_entries = parse_agents_field(agents)
-        # Filter to valid agents
-        agent_entries = [
-            e for e in agent_entries if e["agent"] in VALID_AGENTS
-        ]
-        if not agent_entries:
-            agent_entries = [{"agent": DEFAULT_AGENT, "model": ""}]
-        if mode == "single":
-            agent_entries = agent_entries[:1]
-        else:
-            seen_a2: set[tuple] = set()
-            agent_entries = [e for e in agent_entries if not ((e["agent"], e.get("model", ""), e.get("effort", "")) in seen_a2 or seen_a2.add((e["agent"], e.get("model", ""), e.get("effort", ""))))]
+
 
         challenge_id = uuid.uuid4().hex[:12]
         challenge_dir = CHALLENGES_DIR / challenge_id
@@ -9729,8 +9193,8 @@ async def plugin_import_challenges(request: Request) -> JSONResponse:
         for entry in agent_entries:
             agent_name = entry["agent"]
             run_id = uuid.uuid4().hex[:8]
-            run_model = entry.get("model") or model or resolved_default_model(agent_name)
-            run_effort = normalize_effort_for_agent(agent_name, entry.get("effort") or effort)
+            run_model = entry["model"]
+            run_effort = entry["effort"]
             runs[run_id] = make_run(
                 run_id=run_id,
                 agent=agent_name,
@@ -9755,7 +9219,7 @@ async def plugin_import_challenges(request: Request) -> JSONResponse:
             "status": challenge_status,
             "created_at": datetime.now().isoformat(),
             "files": sorted(file_data.keys()),
-            "enabled_skills": ch_enabled_skills,
+            **ch_skill_policy,
             "error": None,
             "runs": runs,
             "_plugin": plugin_name,
@@ -9877,9 +9341,8 @@ async def rescan_challenge_for_flags(
 
 
 async def add_flag_format(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -9918,9 +9381,8 @@ async def add_flag_format(request: Request) -> JSONResponse:
 
 async def add_manual_flag(request: Request) -> JSONResponse:
     """Persist a user-provided flag candidate without auto-detecting text."""
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -9957,9 +9419,8 @@ async def add_manual_flag(request: Request) -> JSONResponse:
 
 
 async def update_challenge_skills(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -10017,11 +9478,14 @@ async def _mutate_run_goal(
         return public_run_summary(challenge, run)
 
     provider = get_provider(run.get("agent", ""))
+    gateway = await prepare_gateway_run(challenge, run)
     run_cwd = get_run_cwd(challenge_id, run)
+    resources = await prepare_runtime_resources(challenge, run, run_cwd)
+    await _append_run_event(challenge_id, run_id, run, resources)
     if clear:
         if not provider.clear_thread_goal:
             raise RuntimeError("provider does not support clearing goals")
-        await provider.clear_thread_goal(thread_id, run_cwd)
+        await provider.clear_thread_goal(thread_id, run_cwd, gateway=gateway)
         event = {
             "type": "run_goal",
             "provider": "codex",
@@ -10031,7 +9495,7 @@ async def _mutate_run_goal(
     else:
         if not provider.set_thread_goal:
             raise RuntimeError("provider does not support editing goals")
-        goal = await provider.set_thread_goal(thread_id, objective, run_cwd)
+        goal = await provider.set_thread_goal(thread_id, objective, run_cwd, gateway=gateway)
         event = {
             "type": "run_goal",
             "provider": "codex",
@@ -10044,9 +9508,8 @@ async def _mutate_run_goal(
 
 
 async def update_run_goal(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -10073,6 +9536,8 @@ async def update_run_goal(request: Request) -> JSONResponse:
             run,
             objective=objective,
         )
+    except GatewayError as exc:
+        return gateway_error_response(exc)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except (asyncio.TimeoutError, RuntimeError) as exc:
@@ -10085,9 +9550,8 @@ async def update_run_goal(request: Request) -> JSONResponse:
 
 
 async def clear_run_goal(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -10107,6 +9571,8 @@ async def clear_run_goal(request: Request) -> JSONResponse:
             run,
             clear=True,
         )
+    except GatewayError as exc:
+        return gateway_error_response(exc)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except (asyncio.TimeoutError, RuntimeError) as exc:
@@ -10119,9 +9585,8 @@ async def clear_run_goal(request: Request) -> JSONResponse:
 
 
 async def update_run_skills(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     challenge_id = request.path_params["id"]
@@ -10144,10 +9609,10 @@ async def update_run_skills(request: Request) -> JSONResponse:
     reset = bool(body.get("reset", False))
     apply_to_all = bool(body.get("apply_to_all", False))
     resume = body.get("resume", True) is not False
-    enabled_skills = [] if reset else normalize_enabled_skills(
-        body.get("enabled_skills"),
-        default=[],
-    )
+    try:
+        skill_policy = skill_policy_from_request({"skills_mode": "inherit"} if reset else body, scope="run")
+    except GatewayError as exc:
+        return gateway_error_response(exc)
 
     if apply_to_all:
         targets = [
@@ -10169,6 +9634,12 @@ async def update_run_skills(request: Request) -> JSONResponse:
             status_code=409,
         )
 
+    if resume:
+        try:
+            for _, target_run in targets:
+                await prepare_gateway_run(challenge, target_run)
+        except GatewayError as exc:
+            return gateway_error_response(exc)
     updated_runs = []
     for target_id, target_run in targets:
         old_effective_skills = run_enabled_skills(challenge, target_run)
@@ -10176,10 +9647,7 @@ async def update_run_skills(request: Request) -> JSONResponse:
             await stop_run(target_run, "skills_changed")
             finish_run_timer(target_run)
 
-        if reset:
-            target_run.pop("enabled_skills", None)
-        else:
-            target_run["enabled_skills"] = enabled_skills
+        target_run.update(skill_policy)
         sync_run_skill_links(challenge, target_run)
 
         effective_skills = run_enabled_skills(challenge, target_run)
@@ -10202,6 +9670,7 @@ async def update_run_skills(request: Request) -> JSONResponse:
             "type": "run_skills",
             "run_id": target_id,
             "enabled_skills": effective_skills,
+            "skills_mode": skills_mode(target_run, scope="run"),
             "skill_override": run_has_skill_override(target_run),
             "message": (
                 "Run skills reset to challenge defaults."
@@ -10239,6 +9708,7 @@ async def update_run_skills(request: Request) -> JSONResponse:
         "status": challenge["status"],
         "runs": updated_runs,
         "enabled_skills": challenge_enabled_skills(challenge),
+        "skills_mode": challenge_skills_mode(challenge),
     })
 
 
@@ -10248,9 +9718,8 @@ async def plugin_submit_flag(request: Request) -> JSONResponse:
     Resolves connection config from the challenge's _connection_id,
     falling back to _source_url lookup if needed.
     """
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     body, json_err = await read_json_object(request)
@@ -10516,15 +9985,13 @@ async def agent_submit_answer(request: Request) -> JSONResponse:
 
 
 async def list_connections(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
+    
     return JSONResponse(load_connections())
 
 
 async def delete_connection(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     body, json_err = await read_json_object(request)
@@ -10539,9 +10006,8 @@ async def delete_connection(request: Request) -> JSONResponse:
 
 async def sync_connection(request: Request) -> JSONResponse:
     """Fetch new challenges from a saved connection."""
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     body, json_err = await read_json_object(request)
@@ -10669,8 +10135,7 @@ async def sync_connection(request: Request) -> JSONResponse:
 
 async def poll_connections(request: Request) -> JSONResponse:
     """Background poll: check all connections for new challenges and updated scores."""
-    if err := require_auth(request):
-        return err
+    
 
     connections = load_connections()
     if not connections:
@@ -11108,8 +10573,7 @@ def _dns_forward_enabled() -> bool:
 
 
 async def vpn_status(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
+    
 
     if not _wg_installed():
         return JSONResponse({
@@ -11130,9 +10594,8 @@ async def vpn_status(request: Request) -> JSONResponse:
 
 
 async def vpn_configure(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     if not _wg_installed():
@@ -11225,9 +10688,8 @@ async def vpn_configure(request: Request) -> JSONResponse:
 
 
 async def vpn_toggle(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
 
     if not _wg_installed():
@@ -11767,6 +11229,12 @@ async def _discord_resume_runs(
     continue_msg: str = "Continue solving the challenge.",
     actor: str = "",
 ) -> str:
+    targets = [(rid, run) for rid, run in challenge["runs"].items() if run["status"] in ("failed", "completed")]
+    try:
+        for _, run in targets:
+            await prepare_gateway_run(challenge, run)
+    except GatewayError as exc:
+        return exc.public_message
     resumed = []
     for run_id, run in challenge["runs"].items():
         if run["status"] not in ("failed", "completed"):
@@ -12447,13 +11915,11 @@ async def _handle_discord_interaction(interaction: dict) -> None:
             return
 
         steer_message = f"[{author} via Discord]: {message}"
-        await _steer_run_with_message(
-            ch_id,
-            target_run_id,
-            target_run,
-            steer_message,
-            stop_reason="discord_steer",
-        )
+        try:
+            await _steer_run_with_message(ch_id, target_run_id, target_run, steer_message, stop_reason="discord_steer")
+        except GatewayError as exc:
+            await bot.respond_to_interaction(interaction_id, interaction_token, exc.public_message, flags=64)
+            return
         challenge["status"] = derive_challenge_status(challenge)
         save_metadata(challenge)
         await bot.respond_to_interaction(
@@ -12627,28 +12093,8 @@ async def _handle_discord_interaction(interaction: dict) -> None:
                 interaction_id, interaction_token, "No agents are currently running")
 
     elif cmd == "resume":
-        count = 0
-        for run_id, run in challenge["runs"].items():
-            if run["status"] in ("failed", "completed"):
-                run["status"] = "solving"
-                run.pop("_stop_reason", None)
-                run["task"] = asyncio.create_task(
-                    run_agent_task(
-                        ch_id,
-                        run_id,
-                        continue_msg="Continue solving the challenge",
-                    )
-                )
-                count += 1
-        if count:
-            challenge["status"] = derive_challenge_status(challenge)
-            save_metadata(challenge)
-            await bot.respond_to_interaction(
-                interaction_id, interaction_token,
-                f"{author} resumed {count} agent(s)")
-        else:
-            await bot.respond_to_interaction(
-                interaction_id, interaction_token, "No agents to resume")
+        message = await _discord_resume_runs(ch_id, challenge, actor=author)
+        await bot.respond_to_interaction(interaction_id, interaction_token, message)
 
     elif cmd == "solved":
         flag = options.get("flag", "")
@@ -12803,6 +12249,10 @@ async def _reconcile_discord_gateway() -> None:
 
 @asynccontextmanager
 async def lifespan(app):
+    global _category_catalog_status
+    _category_catalog_status = await bootstrap_skill_sources(APP_ROOT_DIR)
+    invalidate_skill_catalog_cache()
+    await asyncio.to_thread(discover_skill_catalog)
     _load_swarm_log()
     asyncio.create_task(_reconcile_discord_gateway())
     asyncio.create_task(_swarm_idle_loop())
@@ -12822,15 +12272,7 @@ async def lifespan(app):
 
 ADVISOR_RUN_ID = "advisor"
 ADVISOR_MAX_MESSAGES = 400
-# The advisor defaults to Claude Sonnet 4.6 (fast/cheap for read+research),
-# independent of the solver default. Other providers use their own default.
-ADVISOR_DEFAULT_MODEL = "claude-sonnet-4-6"
 
-
-def _advisor_default_model(agent: str) -> str:
-    if agent == "claude":
-        return ADVISOR_DEFAULT_MODEL
-    return resolved_default_model(agent)
 
 # Ephemeral in-memory advisor sessions (NOT persisted): challenge_id -> session.
 advisor_sessions: dict[str, dict] = {}
@@ -13012,11 +12454,20 @@ async def _advisor_emit(cid: str, data: dict) -> None:
         await _broadcast_to_ws_set(s["ws_clients"], data)
 
 
-async def run_advisor_turn(cid: str, text: str) -> None:
+async def run_advisor_turn(cid: str, text: str, *, gateway: GatewayRuntime | None = None) -> None:
     s = _get_advisor_session(cid)
     challenge = challenges.get(cid)
     if not challenge:
         return
+    try:
+        gateway = gateway or await prepare_gateway_run(challenge, s)
+        gateway_models = [row["id"] for row in await model_gateway.catalog()]
+    except GatewayError as exc:
+        s["status"] = "idle"
+        await _advisor_emit(cid, {"type": "advisor_event", "event": {"type": "error", "message": exc.public_message}})
+        await _advisor_emit(cid, {"type": "advisor_status", "status": "idle"})
+        return
+
     provider = get_provider(s["agent"])
     async with s["lock"]:
         s["status"] = "thinking"
@@ -13034,12 +12485,16 @@ async def run_advisor_turn(cid: str, text: str) -> None:
                 description=str(challenge.get("description", ""))[:2000],
             ) + "\n\nOperator: " + text
         try:
+            resources = await prepare_runtime_resources(challenge, s, adv_cwd)
+            s["messages"].append({"role": "agent", "event": resources})
+            await _advisor_emit(cid, {"type": "advisor_event", "event": resources})
             async for event in provider.run_agent(
                 prompt=prompt, model=s["model"], effort=s["effort"],
                 cwd=str(adv_cwd), continue_session=is_continue,
                 session_state=s["session_state"], challenge_id=cid, run_id="",
                 _advisor_tools=_advisor_make_tools(cid),
-                _env=agent_runtime_env(s["agent"]),
+                _gateway=gateway,
+                _gateway_models=gateway_models,
             ):
                 if not isinstance(event, dict):
                     continue
@@ -13058,40 +12513,27 @@ async def run_advisor_turn(cid: str, text: str) -> None:
 
 
 async def advisor_get(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
+    
     cid = request.path_params["id"]
     if cid not in challenges:
         return JSONResponse({"error": "not found"}, status_code=404)
+    payload = await gateway_catalog_payload()
+    settings = load_settings()
+    agent = settings.get("default_agent") or DEFAULT_AGENT
+    meta = next((row for row in payload["agents"] if row["name"] == agent), payload["agents"][0])
     s = advisor_sessions.get(cid)
-    if not s:
-        return JSONResponse({
-            "config": {"agent": DEFAULT_AGENT,
-                       "model": _advisor_default_model(DEFAULT_AGENT),
-                       "effort": ""},
-            "messages": [], "status": "idle", "started": False,
-            "agents": [_provider_choice(p) for p in PROVIDERS.values()],
-        })
-    return JSONResponse({
-        "config": {"agent": s["agent"] or DEFAULT_AGENT,
-                   "model": s["model"], "effort": s["effort"]},
-        "messages": s["messages"][-ADVISOR_MAX_MESSAGES:],
-        "status": s["status"], "started": s["started"],
-        "agents": [_provider_choice(p) for p in PROVIDERS.values()],
-    })
-
-
-def _provider_choice(provider) -> dict:
-    return {"name": provider.name, "label": provider.label,
-            "models": [{"value": v, "label": l}
-                       for v, l in provider.resolved_models()],
-            "default_model": provider.resolved_default_model()}
+    config = {"agent": s["agent"], "model": s["model"], "effort": s["effort"]} if s and s["agent"] else {"agent": meta["name"], "model": meta["default_model"], "effort": meta["selected_effort"]}
+    config.update({"skills_mode": skills_mode(s or {}, scope="run"),
+                   "enabled_skills": run_enabled_skills(challenges[cid], s or {})})
+    return JSONResponse({"config": config,
+                         "messages": s["messages"][-ADVISOR_MAX_MESSAGES:] if s else [],
+                         "status": s["status"] if s else "idle", "started": s["started"] if s else False,
+                         "agents": payload["agents"], "gateway": payload["gateway"]})
 
 
 async def advisor_send(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
     cid = request.path_params["id"]
     if cid not in challenges:
@@ -13102,26 +12544,35 @@ async def advisor_send(request: Request) -> JSONResponse:
     message = str_field(body.get("message", "")).strip()
     if not message:
         return JSONResponse({"error": "message required"}, status_code=400)
+    existing = advisor_sessions.get(cid)
+    if existing and existing["status"] == "thinking":
+        return JSONResponse({"error": "advisor is busy"}, status_code=409)
+    try:
+        if existing and existing["started"]:
+            selection = {key: existing[key] for key in ("agent", "model", "effort")}
+            selection.update(persisted_skill_policy(existing, scope="run"))
+        else:
+            row = {key: body[key] for key in ("agent", "model", "effort") if key in body}
+            row.setdefault("agent", load_settings().get("default_agent") or DEFAULT_AGENT)
+            selection = (await resolve_agent_entries({"agents": [row]}))[0]
+            selection.update(skill_policy_from_request(body, scope="run"))
+        gateway = await prepare_gateway_run(challenges[cid], selection)
+    except GatewayError as exc:
+        return gateway_error_response(exc)
     s = _get_advisor_session(cid)
     if s["status"] == "thinking":
         return JSONResponse({"error": "advisor is busy"}, status_code=409)
-    # Configure provider/model before the first turn (locked once started).
-    if not s["started"]:
-        agent = str_field(body.get("agent", "")) or DEFAULT_AGENT
-        if agent not in VALID_AGENTS:
-            return JSONResponse({"error": f"invalid agent: {agent}"},
-                                status_code=400)
-        s["agent"] = agent
-        s["model"] = str_field(body.get("model", "")) or _advisor_default_model(agent)
-        s["effort"] = str_field(body.get("effort", ""))
-    asyncio.create_task(run_advisor_turn(cid, message))
+    if s["started"] and any(s[key] != selection[key] for key in ("agent", "model", "effort")):
+        return JSONResponse({"error": "Advisor selection is locked; reset advisor to change it"}, status_code=409)
+    s.update(selection)
+    s["status"] = "thinking"
+    asyncio.create_task(run_advisor_turn(cid, message, gateway=gateway))
     return JSONResponse({"ok": True})
 
 
 async def advisor_reset(request: Request) -> JSONResponse:
-    if err := require_auth(request):
-        return err
-    if err := require_csrf(request):
+    
+    if err := require_same_origin(request):
         return err
     cid = request.path_params["id"]
     s = advisor_sessions.get(cid)
@@ -13138,10 +12589,7 @@ async def advisor_ws(websocket: WebSocket):
     if not websocket_origin_allowed(websocket):
         await websocket.close(code=4003)
         return
-    if not websocket.session.get("authenticated"):
-        if not _check_basic_auth(websocket.headers.get("authorization", "")):
-            await websocket.close(code=4001)
-            return
+    
     cid = websocket.path_params["id"]
     if cid not in challenges:
         await websocket.close(code=4004)
@@ -13166,13 +12614,9 @@ async def advisor_ws(websocket: WebSocket):
 
 routes = [
     Route("/", index),
-    Route("/api/login", login, methods=["POST"]),
-    Route("/api/logout", logout, methods=["POST"]),
-    Route("/api/csrf-token", csrf_token, methods=["GET"]),
     Route("/api/agents", list_agents, methods=["GET"]),
-    Route("/api/agents/auth/status", agent_auth_status, methods=["GET"]),
-    Route("/api/agents/auth/start", start_agent_auth, methods=["POST"]),
-    Route("/api/agents/auth/env", set_agent_env_auth, methods=["POST"]),
+    Route("/api/agents/gateway", get_gateway, methods=["GET"]),
+    Route("/api/agents/gateway", update_gateway, methods=["PUT"]),
     Route("/api/usage", get_usage, methods=["GET"]),
     Route("/api/vpn", vpn_status, methods=["GET"]),
     Route("/api/vpn/configure", vpn_configure, methods=["POST"]),
@@ -13204,6 +12648,7 @@ routes = [
           methods=["POST"]),
     Route("/api/swarm/instances/{name}", swarm_delete_instance, methods=["DELETE"]),
     Route("/api/skills", get_skills, methods=["GET"]),
+    Route("/api/resources", get_resources, methods=["GET"]),
     Route("/api/skills/upload", upload_skill, methods=["POST"]),
     Route("/api/discord/test", discord_test, methods=["POST"]),
     Route("/api/discord/channels", discord_channels, methods=["POST"]),
@@ -13238,6 +12683,8 @@ routes = [
     ),
     Route("/api/challenges/{id}/runs/{run_id}/events", list_run_events, methods=["GET"]),
     Route("/api/challenges/{id}/transcript-search", search_challenge_transcript, methods=["GET"]),
+    Route("/api/challenges/delete-bulk", delete_challenges_bulk, methods=["POST"]),
+    Route("/api/challenges", delete_challenges_bulk, methods=["DELETE"]),
     Route("/api/challenges/{id}", get_challenge, methods=["GET"]),
     Route("/api/challenges/{id}", delete_challenge, methods=["DELETE"]),
     Route("/api/challenges/{id}/files", list_files, methods=["GET"]),
@@ -13247,7 +12694,7 @@ routes = [
     Route("/api/challenges/{id}/advisor", advisor_get, methods=["GET"]),
     Route("/api/challenges/{id}/advisor", advisor_send, methods=["POST"]),
     Route("/api/challenges/{id}/advisor/reset", advisor_reset, methods=["POST"]),
-    WebSocketRoute("/ws/agents/auth/{session_id}", agent_auth_ws),
+
     WebSocketRoute("/ws/events", global_events_ws),
     WebSocketRoute("/ws/{id}/advisor", advisor_ws),
     WebSocketRoute("/ws/{id}/{run_id}", challenge_ws),
@@ -13316,16 +12763,6 @@ class NoCacheStaticMiddleware:
 app = Starlette(
     routes=routes,
     lifespan=lifespan,
-    middleware=[
-        Middleware(
-            SessionMiddleware,
-            secret_key=SESSION_SECRET,
-            max_age=86400,
-            session_cookie="ctf_session",
-            same_site="lax",
-            https_only=TLS_ENABLED,
-        ),
-    ],
 )
 app = SecurityHeadersMiddleware(app)
 app = NoCacheStaticMiddleware(app)
@@ -13338,8 +12775,8 @@ if __name__ == "__main__":
 
     uvicorn.run(
         app,
-        host="0.0.0.0",
-        port=443,
+        host="127.0.0.1",
+        port=8000,
         log_level="info",
         ssl_certfile=ssl_certfile,
         ssl_keyfile=ssl_keyfile,

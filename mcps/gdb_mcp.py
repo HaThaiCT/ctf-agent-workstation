@@ -2,15 +2,17 @@
 """GDB MCP Server — persistent GDB passthrough for Claude Code."""
 
 import asyncio
+import os
 import re
+import shlex
 import signal
+from contextlib import asynccontextmanager
 
-from mcp.server.fastmcp import FastMCP
+import anyio
+from mcp.server import MCPServer
 
 PROMPT = "(gdb-mcp) "
 _ANSI_RE = re.compile(rb"\x1b\[[0-9;]*m|\x01[^\x02]*\x02")
-
-mcp = FastMCP("gdb")
 
 
 class GDBSession:
@@ -31,6 +33,7 @@ class GDBSession:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
         )
         startup = await self._read_until("(gdb) ")
         # Set custom prompt for reliable output boundary detection
@@ -109,21 +112,41 @@ class GDBSession:
         return buf.decode(errors="replace"), ""
 
     async def stop(self):
-        if not self.alive:
+        proc = self.proc
+        if proc is None:
             return
         try:
-            self.proc.stdin.write(b"quit\ny\n")
-            await self.proc.stdin.drain()
-            await asyncio.wait_for(self.proc.wait(), timeout=5)
-        except (asyncio.TimeoutError, ProcessLookupError, BrokenPipeError):
+            if proc.returncode is None:
+                proc.stdin.write(b"quit\ny\n")
+                await proc.stdin.drain()
+                await asyncio.wait_for(proc.wait(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError, BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            # Reap GDB and any local inferior, including on cancellation.
             try:
-                self.proc.kill()
+                os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        self.proc = None
+            await proc.wait()
+            self.proc = None
 
 
 session = GDBSession()
+session_lock = asyncio.Lock()
+
+
+@asynccontextmanager
+async def server_lifespan(_server):
+    try:
+        yield {}
+    finally:
+        # MCP cancels outstanding tools on EOF; cleanup must outlive that scope.
+        with anyio.CancelScope(shield=True):
+            await session.stop()
+
+
+mcp = MCPServer("gdb", lifespan=server_lifespan)
 
 
 @mcp.tool()
@@ -141,9 +164,19 @@ async def gdb_start(
     init_script: path to a GDB Python script to source at startup
                  (e.g. "/opt/gef/gef.py" for bata24 GEF)
     """
+    async with session_lock:
+        try:
+            return await _start_session(binary, remote, args, init_script)
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                await session.stop()
+            raise
+
+
+async def _start_session(binary: str, remote: str, args: str, init_script: str) -> str:
     cmd = ["gdb", "-q", "-nx"]
     if args:
-        cmd.extend(args.split())
+        cmd.extend(shlex.split(args))
     if binary:
         cmd.append(binary)
 
@@ -210,19 +243,39 @@ async def gdb_exec(command: str, timeout: float = 30.0) -> str:
              Use "interrupt" to send SIGINT and stop a running target.
     timeout: max seconds to wait (default 30). Increase for run/continue.
     """
-    if command.strip().lower() == "interrupt":
-        return await session.interrupt()
-    return await session.execute(command, timeout=timeout)
+    async with session_lock:
+        if command.strip().lower() == "interrupt":
+            return await session.interrupt()
+        return await session.execute(command, timeout=timeout)
 
 
 @mcp.tool()
 async def gdb_stop() -> str:
     """Terminate the current GDB session."""
-    if not session.alive:
-        return "No active session."
-    await session.stop()
-    return "GDB session terminated."
+    async with session_lock:
+        if not session.alive:
+            return "No active session."
+        with anyio.CancelScope(shield=True):
+            await session.stop()
+        return "GDB session terminated."
+
+
+async def main():
+    task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, task.cancel)
+    try:
+        await mcp.run_stdio_async()
+    finally:
+        with anyio.CancelScope(shield=True):
+            await session.stop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.remove_signal_handler(sig)
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    try:
+        asyncio.run(main())
+    except asyncio.CancelledError:
+        pass

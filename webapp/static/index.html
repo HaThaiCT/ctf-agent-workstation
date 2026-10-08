@@ -4,22 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CTF Solver</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260520a">
+  <link rel="stylesheet" href="/static/style.css?v=local-direct-dashboard">
 </head>
 <body>
-  <!-- Login -->
-  <div id="login-view" class="view hidden">
-    <div class="login-box">
-      <h1>CTF Solver</h1>
-      <p class="subtitle">AI-powered CTF challenge solver</p>
-      <form id="login-form">
-        <input type="password" id="login-password" placeholder="Password" autofocus>
-        <button type="submit">Login</button>
-      </form>
-      <p id="login-error" class="error hidden"></p>
-    </div>
-  </div>
-
   <!-- Dashboard -->
   <div id="dashboard-view" class="view">
     <header>
@@ -35,12 +22,14 @@
             <div id="sync-connections"></div>
           </div>
         </div>
+        <button id="btn-select-mode" class="btn-ghost">Select</button>
+        <button id="btn-clear-all" class="btn-ghost" title="Clear all challenges and sessions">Clear All</button>
         <button id="btn-export-mode" class="btn-ghost">Export</button>
         <button id="btn-usage" class="btn-ghost">Usage</button>
         <button id="btn-settings" class="btn-ghost">Settings</button>
-        <button id="btn-logout" class="btn-ghost">Logout</button>
       </div>
     </header>
+    <div class="gateway-banner"><span data-gateway-status role="status" aria-live="polite">Loading 9router models…</span><button type="button" class="btn-ghost btn-sm" data-gateway-refresh>Refresh models / Retry</button></div>
     <div id="sync-notify-bar" class="sync-notify-bar hidden"></div>
     <div id="metadata-sync-age" class="metadata-sync-age">Metadata not synced</div>
     <div id="challenges-list"></div>
@@ -48,6 +37,7 @@
       <span id="export-count">0 selected</span>
       <button id="btn-export-select-all" class="btn-ghost btn-sm">Select All</button>
       <button id="btn-export-download" class="btn-primary btn-sm">Download Zip</button>
+      <button id="btn-delete-selected" class="btn-danger btn-sm">Delete Selected</button>
       <button id="btn-export-cancel" class="btn-ghost btn-sm">Cancel</button>
     </div>
     <div id="empty-state" class="empty-state hidden">
@@ -89,27 +79,8 @@
       </div>
     </header>
     <div class="usage-page">
+      <section class="gateway-card" data-gateway-card></section>
       <div id="usage-grid" class="usage-grid"></div>
-      <div id="agent-auth-terminal" class="auth-terminal hidden">
-        <div class="auth-terminal-header">
-          <div>
-            <div id="agent-auth-title" class="auth-terminal-title">Agent Login</div>
-            <div id="agent-auth-subtitle" class="auth-terminal-subtitle"></div>
-          </div>
-          <button id="btn-agent-auth-cancel" class="btn-ghost btn-sm" type="button">Cancel</button>
-        </div>
-        <pre id="agent-auth-output" class="auth-terminal-output"></pre>
-        <form id="agent-auth-input-form" class="auth-terminal-input-row">
-          <input id="agent-auth-input" type="text" autocomplete="off" spellcheck="false" placeholder="Send input to login process">
-          <button class="btn-secondary btn-sm" type="submit">Send</button>
-        </form>
-      </div>
-
-      <!-- Daily Activity Chart (Claude) -->
-      <div id="usage-daily" class="usage-section hidden">
-        <h2 id="usage-daily-title" class="usage-section-title">Daily Activity</h2>
-        <div id="daily-chart" class="daily-chart"></div>
-      </div>
     </div>
   </div>
 
@@ -123,6 +94,7 @@
       </div>
     </header>
     <div class="settings-page">
+      <section class="settings-section gateway-card" data-gateway-card></section>
       <!-- General -->
       <div class="settings-section">
         <h2 class="settings-section-title">General</h2>
@@ -165,13 +137,13 @@
       <!-- Agents -->
       <div class="settings-section">
         <h2 class="settings-section-title">Agents</h2>
-        <p class="text-muted" style="font-size:0.72rem;margin-bottom:0.5rem;">Select agents to use. 1 agent = single mode, 2+ = parallel mode. Set the model for each provider.</p>
+        <p class="text-muted" style="font-size:0.72rem;margin-bottom:0.5rem;">Provider: 9router. Select native harnesses to use. One harness = single mode; two or more = parallel mode. Model and effort are saved per harness.</p>
         <div id="settings-agent-list"></div>
       </div>
 
       <div class="settings-section">
         <h2 class="settings-section-title">Default Skills</h2>
-        <p class="text-muted" style="font-size:0.72rem;margin-bottom:0.5rem;">Selected skills are enabled by default for new challenges.</p>
+        <p class="text-muted" style="font-size:0.72rem;margin-bottom:0.5rem;">Auto selects related skills when runs start. Manual selection is optional and applies only to new challenges.</p>
         <div class="skill-upload-row">
           <input type="file" id="settings-skill-upload" accept=".zip,.md">
           <button type="button" id="btn-settings-skill-upload" class="btn-ghost btn-sm">Upload Skill</button>
@@ -182,6 +154,11 @@
           <button type="button" class="btn-ghost btn-sm" data-skill-action="none" data-skill-target="#settings-skill-list">Select None</button>
         </div>
         <div id="settings-skill-list" class="skill-checklist"></div>
+      </div>
+      <div class="settings-section">
+        <h2 class="settings-section-title">Runtime Resources</h2>
+        <div id="settings-resource-status" class="resource-status" role="status" aria-live="polite">Loading sources and MCP availability…</div>
+        <button type="button" id="btn-resources-refresh" class="btn-ghost btn-sm">Refresh resources / Retry</button>
       </div>
 
       <div class="settings-section">
@@ -577,7 +554,8 @@
             </div>
             <div id="detail-files" class="info-meta"></div>
             <div class="skill-edit-section">
-              <div class="flags-header">Default Skills</div>
+              <div class="flags-header">Challenge Skills</div>
+              <p id="detail-skill-mode" class="settings-hint"></p>
               <div id="detail-skill-list" class="skill-readonly-list"></div>
             </div>
             <div class="manual-flag-section">
@@ -620,8 +598,9 @@
         <div id="tab-advisor" class="sidebar-content">
           <div class="advisor-panel">
             <div id="advisor-config" class="advisor-config">
-              <select id="advisor-agent" class="advisor-select" title="Advisor agent"></select>
-              <select id="advisor-model" class="advisor-select" title="Model"></select>
+              <select id="advisor-agent" class="advisor-select" title="Harness" aria-label="Advisor harness"></select>
+              <select id="advisor-model" class="advisor-select" title="9router model" aria-label="Advisor 9router model"></select>
+              <select id="advisor-effort" class="advisor-select" aria-label="Advisor model effort"></select>
               <button id="btn-advisor-reset" class="btn-ghost btn-sm" title="New conversation">Reset</button>
             </div>
             <div id="advisor-log" class="advisor-log">
@@ -687,7 +666,7 @@
       </div>
       <div id="run-skill-list" class="skill-checklist skill-checklist-compact"></div>
       <div class="run-skill-actions">
-        <button type="button" id="btn-run-skills-reset" class="btn-ghost">Reset to Defaults &amp; Resume</button>
+        <button type="button" id="btn-run-skills-reset" class="btn-ghost">Reset to Inherit &amp; Resume</button>
         <button type="button" id="btn-run-skills-apply-all" class="btn-secondary">Apply to All &amp; Resume</button>
         <button type="button" id="btn-run-skills-apply" class="btn-primary">Apply &amp; Resume</button>
       </div>
@@ -838,20 +817,8 @@
 
   <!-- (Manager and VPN settings are now in the Settings view above) -->
 
-  <!-- Auth Warning Modal -->
-  <div id="auth-warning-overlay" class="modal-overlay hidden">
-    <div class="modal auth-warning-modal">
-      <div class="modal-header">
-        <h2>Agent Setup Required</h2>
-        <button id="auth-warning-close" class="btn-icon">&times;</button>
-      </div>
-      <p class="auth-warning-intro">The following agents are not authenticated. Open Usage and use Login, or run the commands below on the server.</p>
-      <div id="auth-warning-items"></div>
-      <button id="auth-warning-dismiss" class="btn-primary btn-full">Got it</button>
-    </div>
-  </div>
 
   <div id="toast-container" class="toast-container"></div>
-  <script src="/static/app.js?v=20260520a"></script>
+  <script src="/static/app.js?v=local-direct-dashboard"></script>
 </body>
 </html>

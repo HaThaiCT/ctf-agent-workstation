@@ -136,7 +136,39 @@ All providers currently use SDK/integration paths:
 | Claude | `claude-agent-sdk` | Native Python client, typed messages |
 | Codex | `codex app-server` | JSON-RPC 2.0 over stdio |
 
-Provider modules still keep command builders and normalizers for compatibility/fallback behavior, but normal webapp runs go through the SDK-style `run_agent` path.
+Provider modules retain command builders and event normalizers, but normal webapp runs use the SDK-style `run_agent` path. Both SDK and CLI fallback require resolved 9router runtime context; neither launches direct account inference.
+
+### Shared Model Gateway
+
+`webapp/model_gateway.py` owns discovery, catalog caching, model/effort policy,
+selection resolution, and private Codex metadata. Import/constructor perform no I/O.
+Default URL: `http://127.0.0.1:20128/v1`. Credentials come from the private saved
+`9router` entry in `state/agent-env-auth.json`, then `NINEROUTER_API_KEY`, then
+readable discovered key files. Only auto-file authentication failures try another
+file. Explicit saved/env credentials never silently switch accounts. Old private
+provider credential entries are retained but are not inference fallback paths.
+
+Catalog GETs use an eight-second timeout, no environment proxy, a 30-second cache,
+and a manager lock shared with configuration/native metadata writes. Failed refresh
+invalidates the old catalog for new starts. One resolver validates `(agent, model,
+effort)` before workspaces, transcript resets, session mutation, or queuing at every
+entrypoint. Exact opaque gateway IDs are preserved. Missing new-row fields receive
+valid presets/defaults; explicit blank model is invalid and explicit blank effort
+remains a harness/provider default. Resume never remaps stored tuples. Unknown
+effort profiles remain provider-managed.
+
+Claude uses child environment plus session settings to prevent global settings
+from overriding its endpoint/model aliases; token stays in child environment only.
+Codex uses a custom `ctf_9router` Responses provider, HTTP-SSE, no native OpenAI auth
+requirement, and native local compaction. Atomic `state/gateway-codex-models.json`
+preserves native instruction/tool metadata and contains the common catalog, not
+selected-run defaults. Missing metadata disables Codex without disabling Claude
+or the dashboard. Neither harness writes global native config.
+
+Settings/Usage separate catalog readiness from native launcher availability;
+readiness does not claim successful inference or account quota. Host-local routing
+rejects swarm targets before assignment/launch. Model selection performs no gateway
+installation/restart, global synchronization, or remote tunneling.
 
 Each run stores provider session state in challenge metadata, for example:
 
@@ -157,21 +189,35 @@ Each term has a 60 second timeout. Bounded matches are added as detected flag ca
 
 ## Skill Catalog and Loading
 
-Repo-owned skills live in `skills/`. Environment setup copies repo-owned and external skills into `all-skills/`, which is the runtime catalog used by the webapp. Settings can also upload a `.zip` skill bundle or a single `SKILL.md`; uploaded skills are installed into `all-skills/` and immediately appear in skill selectors.
+`runtime_resources.py` provides source discovery/bootstrap, deterministic category/file
+skill selection, and per-workspace MCP configuration. App startup discovers the
+checkout skills independently of `APP_ROOT_DIR`, caches the external category library
+once, and prefers app-root uploaded/catalog skills on duplicate names. No installer
+or global skill/config rewrite runs during startup; download errors remain visible.
 
-Global settings store default enabled skills for new challenges. Challenge-level skills are chosen at creation/import time and are then locked. Each run may inherit the challenge defaults or store a run-specific skill override.
+Settings/challenges have Auto or Manual policy. Auto recomputes the base/category/file
+skills at runtime; an unknown category exposes workflows for native discovery.
+Manual keeps the exact operator list, including explicit none. Runs default to
+Inherit and can override Auto/Manual. Metadata persists policy and manual lists,
+never an automatic result as a manual snapshot. Legacy nonempty Settings presets
+and explicit challenge/run lists retain manual semantics.
 
-Selected skills are materialized by symlinking catalog entries into each run's project-level provider directories:
+Every solve/resume, skill-change continuation, Advisor turn, idle goal process and
+CLI fallback materializes skills and MCP context in its own workspace. Claude enables
+project/user settings and named Skill controls. Codex refreshes its inventory but
+filters canonical paths against selected workspace inputs before attaching them.
 
-```text
-_runs/{run_id}/
-  .claude/skills/{skill_name} -> all-skills/{skill_name}
-  .codex/skills/{skill_name} -> all-skills/{skill_name}
-```
+The bundled debugger MCP is added under `ctf_gdb` through session-only configuration,
+using the app Python and absolute server source path; native global MCPs remain
+inherited and are not overwritten. GDB sessions are independent per native process
+and clean up on MCP EOF/cancellation. The server uses MCP 2.x `MCPServer`.
 
-When run skills are changed mid-run, the wrapper stops the selected run or all selected runs, refreshes the symlinks, records a `run_skills` event, and resumes by default. The prompt does not enumerate available skills; agents discover the selected skills through their provider skill directories.
-
-Codex does not currently auto-discover workspace-local `.codex/skills` symlinks in its session skill inventory. The wrapper therefore also attaches the selected `.codex/skills/*/SKILL.md` files as structured Codex `skill` inputs on each turn, including after a mid-run skill change.
+`GET /api/resources` exposes catalog status and prerequisite availability, not a
+connection claim. `runtime_resources` events persist/stream effective skills and
+actual native MCP status. Settings show Auto as default, Manual under advanced
+controls, resource source errors, and debugger availability. Missing GDB/dependencies
+are reported rather than disguised as connected servers. Licensed IDA and other
+CTF binary dependencies are still workstation prerequisites.
 
 ## Status and Solve Lifecycle
 
@@ -246,7 +292,17 @@ Changing Discord settings in the web UI reconciles the gateway: it starts when e
 
 ## Web Security Model
 
-The webapp is protected by HTTP Basic/session authentication. State-changing HTTP routes require a CSRF token. WebSockets require authentication and validate `Origin` against either same-origin or the `ALLOWED_ORIGINS` environment variable.
+The webapp is a local, passwordless tool. There is no Basic/session authentication,
+web password, session cookie, login/logout endpoint, or CSRF-token exchange. Both
+the direct launcher and local service bind `127.0.0.1:8000`; the dashboard and APIs
+work immediately. Native agents can execute commands, so the UI must not be
+published on an untrusted network. Remote VM access uses SSH port forwarding.
+
+Browser mutation requests are checked automatically by Origin/Sec-Fetch-Site
+without tokens or configuration. Headerless local CLI callers are accepted.
+WebSockets retain their same-origin/explicit `ALLOWED_ORIGINS` check without
+authentication. Model/file validation and platform/run submission tokens are
+independent of web login and remain in place.
 
 Browser hardening headers are added by middleware:
 
@@ -325,9 +381,9 @@ Settings persist to `challenges/settings.json`.
 | `theme` | `dark` | UI theme |
 | `auto_submit_flags` | `false` | Auto-submit detected flags to CTF platform |
 | `chat_view_mode` | `split` | Agent view layout: `split` or `tabbed` |
-| `enabled_agents` | empty | Which agents appear in the agent selector; empty means default behavior |
-| `agent_models` | `{}` | Per-agent default model overrides |
-| `agent_efforts` | `{}` | Per-agent default effort overrides |
+| `enabled_agents` | empty | Initial empty means no preset yet; new rows use the valid default harness. Explicit empty saves are rejected. |
+| `agent_models` | `{}` | Exact gateway model presets per harness; disabled presets are retained |
+| `agent_efforts` | `{}` | Model-valid effort presets per harness; blank means harness/provider default |
 | `enabled_skills` | catalog defaults | Global default skill list for new challenges |
 | `max_platform_import_size_gb` | `2.0` | Per-challenge cap for platform-imported files; challenges exceeding it are skipped |
 | `discord_enabled` | `false` | Enable Discord bot integration |

@@ -15,7 +15,7 @@ curl -fsSL https://claude.ai/install.sh | bash
 # Skills are installed by 013_install-skills.sh.
 
 # Install GDB MCP server dependency.
-uv_pip_install --reinstall 'mcp[cli]'
+uv_pip_install --reinstall 'mcp[cli]>=2,<3'
 
 # Register GDB MCP server via claude mcp add (stores in ~/.claude.json).
 # IDA Pro is exposed through the analyze-with-ida-domain-api skill, not MCP.

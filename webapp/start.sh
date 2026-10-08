@@ -2,46 +2,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CREDS_FILE="/root/.ctf-solver-password"
+if [ "$(id -u)" -eq 0 ]; then
+  DEFAULT_ROOT="/root/ctf-agent-wrapper"
+else
+  DEFAULT_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/ctf-agent-workstation/data"
+fi
+export APP_ROOT_DIR="${APP_ROOT_DIR:-$DEFAULT_ROOT}"
 
-# Generate credentials (only on first run)
-if [ ! -f "$CREDS_FILE" ]; then
-  python3 -c "import secrets; print(secrets.token_urlsafe(32))" > "$CREDS_FILE"
-  chmod 600 "$CREDS_FILE"
+PYTHON_BIN="${XDG_DATA_HOME:-$HOME/.local/share}/ctf-agent-workstation/venv/bin/python"
+if [ ! -x "$PYTHON_BIN" ]; then
+  PYTHON_BIN="python3"
 fi
 
-export APP_PASSWORD
-APP_PASSWORD="$(cat "$CREDS_FILE")"
-export SESSION_SECRET
-SESSION_SECRET="$(python3 -c "import secrets; print(secrets.token_hex(32))")"
-
-mkdir -p /root/ctf-agent-wrapper/challenges
-
-# Generate self-signed TLS certificate (only on first run)
-CERT_DIR="/root/.ctf-solver-tls"
-if [ ! -f "$CERT_DIR/cert.pem" ]; then
-  mkdir -p "$CERT_DIR"
-  openssl req -x509 -newkey rsa:2048 -nodes \
-    -keyout "$CERT_DIR/key.pem" \
-    -out "$CERT_DIR/cert.pem" \
-    -days 365 \
-    -subj "/CN=ctf-solver"
-  chmod 600 "$CERT_DIR/key.pem"
-fi
-export TLS_CERTFILE="$CERT_DIR/cert.pem"
-export TLS_KEYFILE="$CERT_DIR/key.pem"
-
-echo ""
-echo "============================================"
-echo "  CTF Solver Web App"
-echo "============================================"
-echo "  Password: $APP_PASSWORD"
-echo "============================================"
-echo ""
-
-# Kill orphaned agent processes from previous runs
-pkill -f "claude.*--input-format stream-json" 2>/dev/null || true
-pkill -f "codex app-server" 2>/dev/null || true
-sleep 1
-
-exec python3 "$SCRIPT_DIR/app.py"
+printf 'CTF Solver: http://127.0.0.1:8000 (no login)\n'
+exec "$PYTHON_BIN" "$SCRIPT_DIR/app.py"

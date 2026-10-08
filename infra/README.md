@@ -2,6 +2,16 @@
 
 Three cloud providers are supported. Pick one and `cd` into its directory.
 
+The passwordless Web UI listens on the VM loopback at port 8000, not its public
+address. After deployment, open an SSH tunnel and browse `http://127.0.0.1:8000`:
+
+```bash
+ssh -N -L 8000:127.0.0.1:8000 root@$(terraform output -raw external_ip)
+```
+
+No web login or generated password is required. Run local 9router on the VM before
+starting model-backed solves; do not publish the native-agent UI publicly.
+
 ## Hetzner (`infra/hetzner/`)
 
 ```bash
@@ -16,8 +26,6 @@ terraform apply
 # Once done, SSH in with:
 ssh -i ~/.ssh/id_rsa root@$(terraform output -raw external_ip)
 
-# Get the web UI password:
-terraform output -raw webapp_password
 
 # Re-run only the long install-script bootstrap:
 terraform apply -replace=null_resource.setup_environment

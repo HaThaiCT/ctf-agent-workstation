@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Automatic Skills and MCP
+
+- Discover bundled/category/uploaded skills automatically without rebuilding or
+  deleting the runtime catalog. Auto chooses workflows by category/file type;
+  Manual and per-run Inherit retain exact operator selection semantics.
+- Claude project skill discovery and Codex structured inputs are populated before
+  fresh/resumed runs, skill changes and Advisor turns.
+- Add GDB MCP per native session, preserving existing native server configuration.
+  Native connection events are separate from availability; GDB uses MCP 2.x and
+  cleans up child sessions on disconnect.
+
+### Direct Local Dashboard
+
+- Removed web login/logout, Basic authentication, session cookies, password/secret
+  environment requirements, login throttling, and CSRF-token exchange.
+- Dashboard/deep links open immediately; settings writes and live WebSockets need
+  no credentials. Automatic same-origin checks and input validation remain.
+- Local launcher binds loopback port 8000, without generating password/TLS files or
+  killing unrelated agents. Cloud deployment instructions use SSH forwarding and
+  no longer wait for or export obsolete web passwords.
+
+### Local 9router Model Selection
+
+- Both Claude Code and Codex route through one auto-discovered local 9router
+  gateway, without native login, sync wrappers, or global config writes.
+- Dynamic catalog/model-specific effort menus are shared across creation,
+  bulk/import, Add Agent, Settings, and Advisor; presets are remembered.
+- Unsupported/unavailable tuples fail before state mutation, without remapping
+  history. Host-local routing rejects swarm execution.
+- Settings/Usage show gateway/native-harness readiness instead of native auth
+  or quota. Private keys stay out of public APIs and run metadata.
+
 ### WireGuard Client Config Generation
 
 The VPN settings flow now generates the client keypair on the server and

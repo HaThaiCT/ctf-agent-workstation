@@ -1,18 +1,26 @@
 # Skills
 
-Skills come from two sources:
+Skills are discovered automatically from these sources, in override order:
 
-1. **This repo** — forensics and tool-specific skills
-2. **[ljagiello/ctf-skills](https://github.com/ljagiello/ctf-skills)** — category skills (pwn, web, crypto, rev, misc, osint, malware, AI/ML) copied into the runtime skill catalog during install-script setup
+1. This checkout `skills/` (even when `APP_ROOT_DIR` is elsewhere).
+2. The category library [ljagiello/ctf-skills](https://github.com/ljagiello/ctf-skills),
+   fetched once on startup into `APP_ROOT_DIR/cache/ctf-skills`.
+3. App-root `skills/` and `all-skills/`, including uploaded skills.
+
+Existing uploaded skills override same-name bundled entries and are never deleted
+by automatic startup. A failed download is reported; bundled skills remain usable.
+
+**Auto** selects the base evidence workflow plus skills matching challenge category
+and file types. Unknown challenges expose category/tool workflows for discovery.
+**Manual** uses exactly the chosen list (empty means none). Runs can inherit the
+challenge policy, select Auto independently, or override it manually.
+
+Selected directories are symlinked into run-local `.claude/skills` and
+`.codex/skills` before every launch/resume. Claude explicitly enables project skill
+discovery; Codex attaches only those workspace selections as structured skill
+inputs. The native agent decides when to apply a discovered workflow.
 
 ## This Repo
-
-The repository groups skills by source domain for maintainability. During
-install-script setup, `install_scripts/013_install-skills.sh` copies each directory
-that contains a `SKILL.md` into `all-skills/` as a top-level skill directory
-named from its frontmatter `name:` field. The web app symlinks selected skills
-from `all-skills/` into each challenge run's `.claude/skills` and
-`.codex/skills` directories.
 
 ### Forensics
 
@@ -34,7 +42,9 @@ from `all-skills/` into each challenge run's `.claude/skills` and
 
 ## External (ljagiello/ctf-skills)
 
-Copied to `all-skills/` by `install_scripts/013_install-skills.sh`.
+Cached automatically on app startup. Provisioning may also populate `all-skills/`
+with `install_scripts/013_install-skills.sh`; do not rerun that destructive catalog
+rebuild to refresh the running app.
 
 | Skill | Category |
 |---|---|
