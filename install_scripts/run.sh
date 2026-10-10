@@ -3,6 +3,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f /etc/os-release ] && grep -q '^ID=kali' /etc/os-release 2>/dev/null; then
+  exec bash "$SCRIPT_DIR/kali_setup.sh" "$@"
+fi
 # shellcheck source=install_scripts/lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 

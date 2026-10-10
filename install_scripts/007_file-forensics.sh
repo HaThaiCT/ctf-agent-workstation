@@ -16,7 +16,6 @@ apt_install \
   pngcheck \
   imagemagick \
   steghide \
-  stegseek \
   zbar-tools \
   ruby-dev \
   sox \

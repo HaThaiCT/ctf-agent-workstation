@@ -4,7 +4,7 @@ Extracts file summaries, binary protections (checksec/readelf), network capture 
 and archive contents before agent initialization, producing a structured prompt context.
 """
 from __future__ import annotations
-
+import ipaddress
 import logging
 import os
 import re
@@ -15,12 +15,16 @@ import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
-
+from urllib.parse import urlsplit
 try:
     from .tool_environment import probe_host_environment
+    from .runtime_resources import normalize_challenge_category
 except ImportError:
     from tool_environment import probe_host_environment
-
+    try:
+        from runtime_resources import normalize_challenge_category
+    except ImportError:
+        normalize_challenge_category = lambda c: c.strip().lower()
 log = logging.getLogger(__name__)
 
 MAX_INSPECT_FILES = 20
@@ -32,11 +36,138 @@ SUBPROCESS_TIMEOUT = 5.0
 class TargetInspection:
     file_summaries: list[dict[str, Any]] = field(default_factory=list)
     binary_protections: dict[str, dict[str, Any]] = field(default_factory=dict)
-    archive_contents: dict[str, list[str]] = field(default_factory=dict)
+    archive_contents: dict[str, list[str]] = field(default_factory=list)
+    service_targets: list[str] = field(default_factory=list)
+    host_tools: list[str] = field(default_factory=list)
     prompt_context: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+_CATEGORY_ALIASES = {
+    "pwn": "pwn",
+    "binary exploitation": "pwn",
+    "exploitation": "pwn",
+    "kernel": "pwn",
+    "rev": "reverse",
+    "reverse": "reverse",
+    "reversing": "reverse",
+    "reverse engineering": "reverse",
+    "crypto": "crypto",
+    "cryptography": "crypto",
+    "web": "web",
+    "web exploitation": "web",
+    "forensic": "forensics",
+    "forensics": "forensics",
+    "stego": "forensics",
+    "steganography": "forensics",
+    "osint": "osint",
+    "malware": "malware",
+    "ai": "ai",
+    "ml": "ai",
+    "ai/ml": "ai",
+    "ai-ml": "ai",
+    "misc": "misc",
+    "miscellaneous": "misc",
+}
+
+
+def _is_valid_hostname(host: str) -> bool:
+    if not host or len(host) > 253:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    labels = host.split(".")
+    for label in labels:
+        if not label or len(label) > 63:
+            return False
+        if not re.match(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$", label):
+            return False
+    return True
+
+
+def extract_service_targets(text: str) -> list[str]:
+    """Extract up to 10 service target endpoints from challenge text."""
+    if not text:
+        return []
+    candidates_with_span: list[tuple[int, int, str]] = []
+
+    # 1. URLs (keep scheme, host, port, path; drop userinfo, query, fragment)
+    for m in re.finditer(r"https?://[^\s<>\"'`\)]+", text):
+        raw = m.group(0).rstrip(".,;:!?)`'\"")
+        end = m.start() + len(raw)
+        try:
+            parts = urlsplit(raw)
+            if parts.scheme in ("http", "https") and parts.hostname:
+                if _is_valid_hostname(parts.hostname):
+                    port = parts.port
+                    if port is not None and not (1 <= port <= 65535):
+                        continue
+                    host_part = parts.hostname
+                    if ":" in host_part and not host_part.startswith("["):
+                        host_part = f"[{host_part}]"
+                    netloc = f"{host_part}:{port}" if port is not None else host_part
+                    path = parts.path or "/"
+                    url_clean = f"{parts.scheme}://{netloc}{path}"
+                    candidates_with_span.append((m.start(), end, url_clean))
+        except Exception:
+            pass
+
+    # 2. nc / ncat HOST PORT
+    for m in re.finditer(r"\b(nc|ncat)\s+([A-Za-z0-9_.-]+)\s+(\d{1,5})\b", text):
+        cmd, host, port_str = m.group(1), m.group(2).strip("`'\".,;:"), m.group(3)
+        try:
+            port = int(port_str)
+            if 1 <= port <= 65535 and _is_valid_hostname(host):
+                candidates_with_span.append((m.start(), m.end(), f"{cmd} {host} {port}"))
+        except Exception:
+            pass
+
+    # 3. Standalone IPv4:port
+    for m in re.finditer(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})\b", text):
+        ip_str, port_str = m.group(1), m.group(2)
+        try:
+            ipaddress.IPv4Address(ip_str)
+            port = int(port_str)
+            if 1 <= port <= 65535:
+                candidates_with_span.append((m.start(), m.end(), f"{ip_str}:{port}"))
+        except Exception:
+            pass
+
+    # 4. Standalone [IPv6]:port
+    for m in re.finditer(r"\[([0-9a-fA-F:]+)\]:(\d{1,5})\b", text):
+        ip_str, port_str = m.group(1), m.group(2)
+        try:
+            ipaddress.IPv6Address(ip_str)
+            port = int(port_str)
+            if 1 <= port <= 65535:
+                candidates_with_span.append((m.start(), m.end(), f"[{ip_str}]:{port}"))
+        except Exception:
+            pass
+
+    # Filter out spans enclosed within another span
+    filtered: list[tuple[int, str]] = []
+    for s1, e1, t1 in candidates_with_span:
+        enclosed = False
+        for s2, e2, _ in candidates_with_span:
+            if s2 <= s1 and e1 <= e2 and (s1 != s2 or e1 != e2):
+                enclosed = True
+                break
+        if not enclosed:
+            filtered.append((s1, t1))
+
+    filtered.sort(key=lambda x: x[0])
+    targets: list[str] = []
+    seen: set[str] = set()
+    for _, target in filtered:
+        if len(target) <= 256 and target not in seen and len(targets) < 10:
+            seen.add(target)
+            targets.append(target)
+    return targets
 
 
 def _format_size(size_bytes: int) -> str:
@@ -251,9 +382,12 @@ def build_preflight_prompt(
     binary_protections: dict[str, dict[str, Any]],
     archive_contents: dict[str, list[str]],
     wordlists: list[Path] | None = None,
+    *,
+    service_targets: list[str] | None = None,
+    host_tools: list[str] | None = None,
 ) -> str:
     """Format pre-flight inspection findings into a concise markdown section."""
-    if not file_summaries and not wordlists:
+    if not file_summaries and not wordlists and not service_targets and not host_tools:
         return ""
 
     lines = [
@@ -284,37 +418,52 @@ def build_preflight_prompt(
         else:
             lines.append(f"- `{name}`: {magic} ({size_str}).")
 
+    if service_targets:
+        targets_str = ", ".join(f"`{t}`" for t in service_targets)
+        lines.append(f"- Service endpoints / targets: {targets_str}")
+
+    if host_tools:
+        tools_str = ", ".join(f"`{t}`" for t in host_tools)
+        lines.append(f"- Relevant host tools available: {tools_str}")
+
     if wordlists:
         wl_str = ", ".join(f"`{w}`" for w in wordlists[:3])
-        lines.append(f"- Wordlists available on host: {wl_str}")
+        lines.append(f"- Web-content discovery wordlists available on host: {wl_str}")
 
     return "\n".join(lines)
 
 
-def inspect_challenge_files(target_dir: Path) -> TargetInspection:
+def inspect_challenge_files(
+    target_dir: Path,
+    *,
+    description: str = "",
+    category: str = "",
+) -> TargetInspection:
     """Perform pre-flight technical inspection on challenge files in target_dir."""
     inspection = TargetInspection()
     target_path = Path(target_dir)
 
-    if not target_path.exists() or not target_path.is_dir():
-        return inspection
+    service_targets = extract_service_targets(description)
+    inspection.service_targets = service_targets
+
+    norm_cat = normalize_challenge_category(category)
 
     candidates: list[Path] = []
-    try:
-        for entry in sorted(target_path.iterdir()):
-            if entry.name.startswith((".", "_")):
-                continue
-            if entry.is_file():
-                candidates.append(entry)
-            elif entry.is_symlink():
-                try:
-                    if entry.resolve().is_file():
-                        candidates.append(entry)
-                except OSError:
+    if target_path.exists() and target_path.is_dir():
+        try:
+            for entry in sorted(target_path.iterdir()):
+                if entry.name.startswith((".", "_")):
                     continue
-    except OSError as exc:
-        log.warning("Failed listing target_dir %s: %s", target_dir, exc)
-        return inspection
+                if entry.is_file():
+                    candidates.append(entry)
+                elif entry.is_symlink():
+                    try:
+                        if entry.resolve().is_file():
+                            candidates.append(entry)
+                    except OSError:
+                        continue
+        except OSError as exc:
+            log.warning("Failed listing target_dir %s: %s", target_dir, exc)
 
     candidates = candidates[:MAX_INSPECT_FILES]
 
@@ -371,18 +520,44 @@ def inspect_challenge_files(target_dir: Path) -> TargetInspection:
             except Exception as exc:
                 log.debug("Error inspecting pcap %s: %s", file_path.name, exc)
 
-    # Get wordlists from host environment
+    # Tool and wordlist context stage
     try:
         env = probe_host_environment()
-        wordlists = env.wordlists
+        avail = {k: v.available for k, v in env.tools.items()}
     except Exception:
-        wordlists = []
+        avail = {}
+        env = None
+
+    if norm_cat == "web":
+        tool_candidates = ["sqlmap", "ffuf", "gobuster", "dirsearch", "nikto"]
+        host_tools = [t for t in tool_candidates if avail.get(t)]
+    elif norm_cat == "pwn":
+        tool_candidates = ["gdb", "checksec", "ROPgadget", "ropper", "one_gadget", "seccomp-tools", "pwntools"]
+        host_tools = [t for t in tool_candidates if avail.get(t)]
+    elif norm_cat in ("reverse", "malware"):
+        tool_candidates = ["ghidra", "rizin", "radare2", "objdump", "readelf", "idapro"]
+        host_tools = [t for t in tool_candidates if avail.get(t)]
+    elif norm_cat == "crypto":
+        tool_candidates = ["z3", "pycryptodome", "sage"]
+        host_tools = [t for t in tool_candidates if avail.get(t)]
+    elif norm_cat == "forensics":
+        tool_candidates = ["tshark", "volatility", "binwalk", "bulk_extractor", "exiftool", "steghide"]
+        host_tools = [t for t in tool_candidates if avail.get(t)]
+    else:
+        host_tools = sorted([k for k, v in avail.items() if v])[:12]
+
+    inspection.host_tools = host_tools
+
+    is_web_relevant = (norm_cat == "web") or any(t.startswith(("http://", "https://")) for t in service_targets)
+    wordlists = env.wordlists if (env and is_web_relevant) else []
 
     inspection.prompt_context = build_preflight_prompt(
         inspection.file_summaries,
         inspection.binary_protections,
         inspection.archive_contents,
         wordlists=wordlists,
+        service_targets=service_targets,
+        host_tools=host_tools,
     )
 
     return inspection

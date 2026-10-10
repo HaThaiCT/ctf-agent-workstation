@@ -91,10 +91,10 @@ async def bootstrap_skill_sources(app_root: Path) -> dict:
 
 
 _CATEGORY_SKILLS = {
-    "pwn": ("ctf-pwn", "kernel-gef-debugging", "craft-rop-chains-with-angrop"),
+    "pwn": ("ctf-pwn", "kernel-gef-debugging", "craft-rop-chains-with-angrop", "pwntools-exploit-crafting"),
     "reverse": ("ctf-reverse", "analyze-with-ida-domain-api"),
     "crypto": ("ctf-crypto",),
-    "web": ("ctf-web",),
+    "web": ("ctf-web", "web-exploitation-toolkit"),
     "forensics": (
         "ctf-forensics",
         "tsk-disk-recovery",
@@ -133,6 +133,37 @@ _CATEGORY_ALIASES = {
     "misc": "misc",
     "miscellaneous": "misc",
 }
+def normalize_challenge_category(cat_str: str) -> str:
+    """Normalize challenge category string into canonical CTF domain."""
+    if not cat_str or not isinstance(cat_str, str):
+        return ""
+    clean = cat_str.strip().lower()
+    if not clean:
+        return ""
+    if clean in _CATEGORY_ALIASES:
+        return _CATEGORY_ALIASES[clean]
+
+    # Token and keyword matching for non-standard categories
+    if any(k in clean for k in ("pwn", "exploit", "binary", "heap", "bof", "rop", "kernel")):
+        return "pwn"
+    if any(k in clean for k in ("web", "http", "api", "xss", "sqli", "injection")):
+        return "web"
+    if any(k in clean for k in ("rev", "revers", "crack", "decompile")):
+        return "reverse"
+    if any(k in clean for k in ("crypto", "cipher", "rsa", "ecc")):
+        return "crypto"
+    if any(k in clean for k in ("forensic", "stego", "pcap", "memory", "disk")):
+        return "forensics"
+    if "osint" in clean:
+        return "osint"
+    if "malware" in clean:
+        return "malware"
+    if any(k in clean for k in ("ai", "ml")):
+        return "ai"
+    if "misc" in clean:
+        return "misc"
+    return ""
+
 
 def _resolve_category_skills(category: str, env: HostEnvironment | None = None) -> tuple[str, ...]:
     """Resolve skills for a category based on available host environment capabilities."""
@@ -156,13 +187,20 @@ def _resolve_category_skills(category: str, env: HostEnvironment | None = None) 
             skills.append("sagemath-crypto-solvers")
         return tuple(skills)
 
-    if category == "pwn":
-        skills = ["ctf-pwn"]
-        if env.has_gdb_enhanced:
-            skills.append("kernel-gef-debugging")
-        skills.append("craft-rop-chains-with-angrop")
+    if category == "web":
+        skills = ["ctf-web"]
+        if env is None or env.has_web_tools:
+            skills.append("web-exploitation-toolkit")
         return tuple(skills)
 
+    if category == "pwn":
+        skills = ["ctf-pwn"]
+        if env is None or env.has_gdb_enhanced:
+            skills.append("kernel-gef-debugging")
+        skills.append("craft-rop-chains-with-angrop")
+        if env is None or (env.tools.get("pwntools") and env.tools["pwntools"].available):
+            skills.append("pwntools-exploit-crafting")
+        return tuple(skills)
     return _CATEGORY_SKILLS.get(category, ())
 
 
@@ -178,7 +216,7 @@ def select_automatic_skills(
         for name in ("ctf-methodology", "ground-your-findings")
         if name in available
     }
-    category = _CATEGORY_ALIASES.get(str(challenge.get("category", "")).strip().lower())
+    category = normalize_challenge_category(str(challenge.get("category", "")))
     if category:
         selected.update(_resolve_category_skills(category, env))
 
@@ -188,62 +226,136 @@ def select_automatic_skills(
         selected.add("kernel-gef-debugging")
 
     extensions = {Path(str(name)).suffix.lower() for name in challenge.get("files", [])}
+    has_so_version = any(".so" in f for f in files)
+
     if extensions & {".apk", ".dex"}:
         selected.update(("apk-analysis", "ctf-reverse"))
     if extensions & {".pcap", ".pcapng", ".cap"}:
         selected.update(("pcap-extraction", "ctf-forensics"))
-    if extensions & {".elf", ".exe", ".dll", ".so", ".bin"}:
+
+    # Binary/ELF detection: explicit binary extensions, .so versions, or files in pwn category
+    is_binary_file = bool(
+        extensions & {".elf", ".exe", ".dll", ".so", ".bin"}
+        or has_so_version
+        or (category in ("pwn", "reverse") and files)
+    )
+    if is_binary_file:
         selected.update(_resolve_category_skills("reverse", env))
-        selected.add("ctf-pwn")
-        selected.add("craft-rop-chains-with-angrop")
+        selected.update(_resolve_category_skills("pwn", env))
+
     if extensions & {".vmem", ".mem", ".dmp"}:
         selected.update(("volatility3-memdump", "ctf-forensics"))
     if extensions & {".img", ".vhd", ".vhdx", ".dd", ".e01"}:
         selected.update(("tsk-disk-recovery", "ctf-forensics"))
     if extensions & {".png", ".jpg", ".jpeg", ".gif", ".pdf", ".doc", ".docx", ".zip"}:
         selected.add("file-repair-and-stego")
-    if not category and not (selected - {"ctf-methodology", "ground-your-findings"}):
-        # Native skill descriptions permit on-demand discovery when category is unknown.
-        for cat in _CATEGORY_SKILLS:
-            selected.update(_resolve_category_skills(cat, env))
-        selected.add("apk-analysis")
+
+    # Web file detection: web assets / node / python web
+    is_web_file = bool(
+        extensions & {".php", ".js", ".ts", ".html", ".css"}
+        or any(f in ("package.json", "server.js", "requirements.txt", "docker-compose.yml", "dockerfile") for f in files)
+    )
+    if is_web_file and category not in ("pwn", "reverse", "crypto", "forensics"):
+        selected.update(_resolve_category_skills("web", env))
+
+    # Do NOT dump all categories when category is unknown.
+    # Retain only base methodology skills unless specific file types above were detected.
     return sorted(selected & available)
 
-def builtin_mcp_status(repo_root: Path) -> dict:
-    script = repo_root / "mcps/gdb_mcp.py"
-    error = ""
-    if not script.is_file():
-        error = "GDB MCP server source is unavailable"
+def builtin_mcp_statuses(repo_root: Path) -> list[dict]:
+    mcp_available = False
+    try:
+        if importlib.util.find_spec("mcp") is not None:
+            if importlib.util.find_spec("mcp.server") is not None and importlib.util.find_spec("mcp.server.mcpserver") is not None:
+                mcp_available = True
+    except Exception:
+        mcp_available = False
+
+    statuses = []
+
+    # 1. ctf_gdb
+    gdb_script = repo_root / "mcps/gdb_mcp.py"
+    gdb_err = ""
+    if not gdb_script.is_file():
+        gdb_err = "GDB MCP server source is unavailable"
     elif not shutil.which("gdb"):
-        error = "GDB executable is unavailable"
-    elif (
-        importlib.util.find_spec("mcp") is None
-        or importlib.util.find_spec("mcp.server.mcpserver") is None
-    ):
-        error = "Python MCP 2.x dependency is unavailable"
-    return {
+        gdb_err = "GDB executable is unavailable"
+    elif not mcp_available:
+        gdb_err = "Python MCP 2.x dependency is unavailable"
+
+    statuses.append({
         "name": "ctf_gdb",
         "source": "builtin",
         "transport": "stdio",
-        "available": not error,
-        "status": "available" if not error else "unavailable",
-        "error": error,
-    }
+        "available": not gdb_err,
+        "status": "available" if not gdb_err else "unavailable",
+        "error": gdb_err,
+    })
+
+    # 2. ctf_decoder
+    decoder_script = repo_root / "mcps/decoder_mcp.py"
+    decoder_err = ""
+    if not decoder_script.is_file():
+        decoder_err = "Decoder MCP server source is unavailable"
+    elif not mcp_available:
+        decoder_err = "Python MCP 2.x dependency is unavailable"
+
+    statuses.append({
+        "name": "ctf_decoder",
+        "source": "builtin",
+        "transport": "stdio",
+        "available": not decoder_err,
+        "status": "available" if not decoder_err else "unavailable",
+        "error": decoder_err,
+    })
+
+    # 3. ctf_binary
+    binary_script = repo_root / "mcps/binary_mcp.py"
+    binary_err = ""
+    if not binary_script.is_file():
+        binary_err = "Binary MCP server source is unavailable"
+    elif not shutil.which("readelf"):
+        binary_err = "readelf executable is unavailable"
+    elif not shutil.which("strings"):
+        binary_err = "strings executable is unavailable"
+    elif not shutil.which("rizin"):
+        binary_err = "rizin executable is unavailable"
+    elif not mcp_available:
+        binary_err = "Python MCP 2.x dependency is unavailable"
+
+    statuses.append({
+        "name": "ctf_binary",
+        "source": "builtin",
+        "transport": "stdio",
+        "available": not binary_err,
+        "status": "available" if not binary_err else "unavailable",
+        "error": binary_err,
+    })
+
+    return statuses
 
 
 def _builtin_mcp_servers(repo_root: Path) -> dict:
-    if not builtin_mcp_status(repo_root)["available"]:
-        return {}
-    return {
-        "ctf_gdb": {
-            "type": "stdio",
-            "command": sys.executable,
-            "args": [str((repo_root / "mcps/gdb_mcp.py").resolve())],
-        }
+    statuses = builtin_mcp_statuses(repo_root)
+    script_map = {
+        "ctf_gdb": "mcps/gdb_mcp.py",
+        "ctf_decoder": "mcps/decoder_mcp.py",
+        "ctf_binary": "mcps/binary_mcp.py",
     }
+    servers = {}
+    for row in statuses:
+        if row["available"]:
+            script_rel = script_map.get(row["name"])
+            if script_rel:
+                servers[row["name"]] = {
+                    "type": "stdio",
+                    "command": sys.executable,
+                    "args": [str((repo_root / script_rel).resolve())],
+                }
+    return servers
 
 
-def prepare_workspace_mcp(cwd: Path, repo_root: Path) -> dict:
+def prepare_workspace_mcp(cwd: Path, repo_root: Path) -> list[dict]:
     """Materialize only workstation-owned MCP config; preserve native/global servers."""
     servers = _builtin_mcp_servers(repo_root)
     content = json.dumps({"mcpServers": servers}, indent=2) + "\n"
@@ -261,7 +373,7 @@ def prepare_workspace_mcp(cwd: Path, repo_root: Path) -> dict:
             os.replace(temporary, path)
         finally:
             Path(temporary).unlink(missing_ok=True)
-    return builtin_mcp_status(repo_root)
+    return builtin_mcp_statuses(repo_root)
 
 
 def workspace_mcp_servers(cwd: str | Path) -> dict:

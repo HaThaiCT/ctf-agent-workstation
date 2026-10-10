@@ -54,11 +54,11 @@ except ImportError:
 
 try:
     from .runtime_resources import (skill_source_roots, bootstrap_skill_sources,
-                                    select_automatic_skills, builtin_mcp_status,
+                                    select_automatic_skills, builtin_mcp_statuses,
                                     prepare_workspace_mcp)
 except ImportError:
     from runtime_resources import (skill_source_roots, bootstrap_skill_sources,
-                                   select_automatic_skills, builtin_mcp_status,
+                                   select_automatic_skills, builtin_mcp_statuses,
                                    prepare_workspace_mcp)
 try:
     from .tool_environment import probe_host_environment
@@ -1056,8 +1056,9 @@ def setup_run_dir(challenge_id: str, run_id: str) -> Path:
         shared_link.symlink_to(shared_dir)
 
     wordlists_candidates = [
-        Path("/usr/share/wordlists"),
-        Path("/usr/share/seclists"),
+        Path("/usr/share/seclists/Discovery/Web-Content"),
+        Path("/usr/share/dirb/wordlists"),
+        Path("/usr/share/dirbuster/wordlists"),
     ]
     wordlists_link = run_dir / "wordlists"
     if not wordlists_link.exists() and not wordlists_link.is_symlink():
@@ -1096,6 +1097,9 @@ def write_submit_answer_helper(challenge_id: str, run_id: str) -> None:
     token = ensure_run_submit_token(run)
     run_dir = get_run_cwd(challenge_id, run)
     scheme = "https" if TLS_ENABLED else "http"
+    port = 443 if TLS_ENABLED else int(os.environ.get("PORT", "8000"))
+    port_str = f":{port}" if (scheme == "http" and port != 80) or (scheme == "https" and port != 443) else ""
+    submit_url = f"{scheme}://127.0.0.1{port_str}/api/agent/submit-answer"
     helper = run_dir / "submit_answer.py"
     helper.write_text(f'''#!/usr/bin/env python3
 """Submit candidate answers for this platform challenge.
@@ -1112,7 +1116,7 @@ import sys
 import urllib.error
 import urllib.request
 
-URL = {json.dumps(f"{scheme}://127.0.0.1:443/api/agent/submit-answer")}
+URL = {json.dumps(submit_url)}
 CHALLENGE_ID = {json.dumps(challenge_id)}
 RUN_ID = {json.dumps(run_id)}
 TOKEN = {json.dumps(token)}
@@ -2291,7 +2295,7 @@ async def prepare_runtime_resources(challenge: dict, run: dict, cwd: Path) -> di
     mode = skills_mode(run, scope="run")
     return {"type": "runtime_resources", "agent": run.get("agent", ""),
             "skills_mode": mode, "effective_skills_mode": challenge_skills_mode(challenge) if mode == "inherit" else mode,
-            "enabled_skills": selected, "skills": selected, "mcp": [mcp],
+            "enabled_skills": selected, "skills": selected, "mcp": mcp,
             "category_catalog": dict(_category_catalog_status)}
 
 
@@ -6255,8 +6259,10 @@ def _build_standard_prompt(
     )
     parts = [
         "You are solving a CTF challenge.",
+        "Solve this challenge strictly from first principles using the provided files, decompilation, code analysis, and specified service endpoints.",
+        "DO NOT search the internet, Google, GitHub, or blogs for challenge writeups, leaked solutions, or similar challenges. The challenge is private and novel; searching for writeups is strictly forbidden and wastes time.",
+        "NEVER guess, blind brute-force, or submit placeholder candidate flags (e.g. 'test', dummy words, or unverified strings). Only submit authentic flags extracted from the target via verified exploit execution or decryption that match the challenge flag format.",
     ]
-    parts.extend(_enabled_hook_prompt_lines())
 
     parts.extend([
         "",
@@ -6331,8 +6337,7 @@ def _build_standard_prompt(
         parts.extend([
             "",
             "The challenge files are in ./challenge_files/ (some may be symlinks).",
-            "Do not inspect parent directories, repository root files, .git metadata, "
-            "or unrelated system paths.",
+            "Stay strictly inside the challenge workspace. Do not inspect parent directories (..), home directory, repository root files, application state, or unrelated system paths.",
         ])
     elif not has_declared_files:
         parts.extend([
@@ -6341,8 +6346,7 @@ def _build_standard_prompt(
             "category, provided flag format, and any remote instance connection "
             "information above.",
             "Do not stop merely because ./challenge_files/ is empty or absent.",
-            "Do not inspect parent directories, repository root files, .git metadata, "
-            "or unrelated system paths.",
+            "Stay strictly inside the challenge workspace. Do not inspect parent directories (..), home directory, repository root files, application state, or unrelated system paths.",
             "Keep command output bounded: avoid unbounded recursive listings, and use "
             "targeted commands with limits (for example, head/tail).",
         ])
@@ -6351,8 +6355,7 @@ def _build_standard_prompt(
             "",
             "The challenge files are in the current directory (some may be symlinks).",
             "Use `ls -la` to list files, not `find . -type f` which misses symlinks.",
-            "Do not inspect parent directories, repository root files, .git metadata, "
-            "or unrelated system paths.",
+            "Stay strictly inside the challenge workspace. Do not inspect parent directories (..), home directory, repository root files, application state, or unrelated system paths.",
             "If the current directory has no challenge files, report that clearly and stop. "
             "Do not search elsewhere for surrogate targets.",
             "Keep command output bounded: avoid unbounded recursive listings, and use "
@@ -7284,7 +7287,12 @@ async def run_agent_task(
     if not continue_msg:
         target_dir = run_cwd / "challenge_files" if (run_cwd / "challenge_files").is_dir() else run_cwd
         try:
-            inspection = await asyncio.to_thread(inspect_challenge_files, target_dir)
+            inspection = await asyncio.to_thread(
+                inspect_challenge_files,
+                target_dir,
+                description=str(challenge.get("description") or ""),
+                category=str(challenge.get("category") or ""),
+            )
             inspection_context = inspection.prompt_context
         except Exception as exc:
             log.warning("[%s/%s] Pre-flight target inspection failed: %s", challenge_id[:8], run_id[:8], exc)
@@ -7847,7 +7855,7 @@ async def get_resources(request: Request) -> JSONResponse:
     return JSONResponse({"skills_mode": skills_mode(settings, scope="settings"),
                          "skills_count": len(discover_skill_catalog()),
                          "automatic_skills": default_enabled_skill_names(),
-                         "mcp": [await asyncio.to_thread(builtin_mcp_status, REPO_ROOT_DIR)],
+                         "mcp": await asyncio.to_thread(builtin_mcp_statuses, REPO_ROOT_DIR),
                          "category_catalog": dict(_category_catalog_status)})
 
 
@@ -9905,7 +9913,10 @@ async def agent_submit_answer(request: Request) -> JSONResponse:
     answer = str_field(body.get("answer", "")).strip()
     if not answer:
         return JSONResponse({"error": "answer required"}, status_code=400)
-
+    if answer.lower() in {"test", "dummy", "placeholder", "flag", "asdf", "1234", "123456", "admin", "guess"}:
+        return JSONResponse({
+            "error": f"Blind/dummy flag submission ('{answer}') is rejected. Extract and verify the authentic flag before submitting."
+        }, status_code=400)
     challenge = challenges.get(challenge_id)
     if not challenge:
         return JSONResponse({"error": "not found"}, status_code=404)

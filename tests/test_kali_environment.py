@@ -24,6 +24,7 @@ from webapp.runtime_resources import (
 )
 from webapp.target_inspector import (
     build_preflight_prompt,
+    extract_service_targets,
     inspect_archive,
     inspect_challenge_files,
     inspect_elf_binary,
@@ -80,12 +81,64 @@ class ToolEnvironmentTests(unittest.TestCase):
     def test_scan_available_wordlists(self):
         with tempfile.TemporaryDirectory() as td:
             p = Path(td)
-            rockyou = p / "rockyou.txt"
-            rockyou.write_text("password123\n")
-            found = scan_available_wordlists([rockyou, p / "absent.txt"])
-            self.assertEqual(len(found), 1)
-            self.assertEqual(found[0], rockyou.resolve())
+            common = p / "common.txt"
+            common.write_text("admin\nlogin\n")
+            sub_dir = p / "subdir"
+            sub_dir.mkdir()
+            link_common = p / "link_common.txt"
+            link_common.symlink_to(common)
+            unreadable = p / "unreadable.txt"
+            unreadable.write_text("secret\n")
+            unreadable.chmod(0o000)
+            try:
+                found = scan_available_wordlists([
+                    common,
+                    sub_dir,
+                    link_common,
+                    p / "absent.txt",
+                    unreadable,
+                ])
+                # Only common.txt should be returned; directory and unreadable are excluded, symlink is deduped
+                self.assertEqual(len(found), 1)
+                self.assertEqual(found[0], common.resolve())
+            finally:
+                unreadable.chmod(0o644)
 
+    def test_default_wordlist_candidates_no_password_corpus(self):
+        from webapp.tool_environment import DEFAULT_WORDLIST_CANDIDATES
+        for cand in DEFAULT_WORDLIST_CANDIDATES:
+            cand_str = str(cand).lower()
+            self.assertNotIn("rockyou", cand_str)
+            self.assertNotEqual(cand_str, "/usr/share/wordlists")
+            self.assertNotEqual(cand_str, "/usr/share/seclists")
+
+    def test_setup_run_dir_wordlists_symlinks_narrow_web_dir(self):
+        from webapp import app as app_module
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            saved_challenges_dir = app_module.CHALLENGES_DIR
+            try:
+                app_module.CHALLENGES_DIR = root / "challenges"
+                app_module.CHALLENGES_DIR.mkdir()
+                run_dir = app_module.setup_run_dir("chall_1", "run_1")
+                wl_link = run_dir / "wordlists"
+                if wl_link.exists() or wl_link.is_symlink():
+                    target = wl_link.resolve()
+                    target_str = str(target)
+                    self.assertNotIn("rockyou", target_str)
+                    self.assertNotEqual(target_str, "/usr/share/wordlists")
+                    self.assertNotEqual(target_str, "/usr/share/seclists")
+                
+                # Verify pre-existing user link/file is not overwritten
+                run_2 = app_module.CHALLENGES_DIR / "chall_1" / "_runs" / "run_2"
+                run_2.mkdir(parents=True)
+                custom_file = run_2 / "wordlists"
+                custom_file.write_text("custom user list")
+                app_module.setup_run_dir("chall_1", "run_2")
+                self.assertTrue(custom_file.is_file())
+                self.assertEqual(custom_file.read_text(), "custom user list")
+            finally:
+                app_module.CHALLENGES_DIR = saved_challenges_dir
 
 class TargetInspectorTests(unittest.TestCase):
     def test_target_inspector_detects_elf_protections(self):
@@ -115,30 +168,52 @@ class TargetInspectorTests(unittest.TestCase):
             contents = inspect_archive(zpath)
             self.assertEqual(contents, ["entry1.txt", "entry2.bin"])
 
-    def test_build_preflight_prompt_formatting(self):
-        summaries = [
-            {"name": "vuln.elf", "size": 1024, "magic_type": "ELF 64-bit LSB executable"},
-            {"name": "notes.txt", "size": 42, "magic_type": "ASCII text"},
-        ]
-        protections = {
-            "vuln.elf": {
-                "arch": "x86-64",
-                "nx": "Enabled",
-                "canary": "Disabled",
-                "pie": "Enabled",
-                "relro": "Full RELRO",
-                "stripped": "No",
-            }
-        }
-        archives = {}
-        prompt = build_preflight_prompt(summaries, protections, archives, [Path("/usr/share/wordlists/rockyou.txt")])
-        self.assertIn("[Pre-flight Target Inspection]:", prompt)
-        self.assertIn("- `vuln.elf`: ELF 64-bit LSB executable", prompt)
-        self.assertIn("NX: Enabled", prompt)
-        self.assertIn("Canary: Disabled", prompt)
-        self.assertIn("- `notes.txt`: ASCII text", prompt)
-        self.assertIn("Wordlists available on host:", prompt)
+    def test_extract_service_targets_parsing_and_bounds(self):
+        sample = "nc chall.example 1337; visit https://ctf.example:8443/login?token=secret#note and 10.10.10.1:9000 and [::1]:5000"
+        targets = extract_service_targets(sample)
+        self.assertEqual(
+            targets,
+            [
+                "nc chall.example 1337",
+                "https://ctf.example:8443/login",
+                "10.10.10.1:9000",
+                "[::1]:5000",
+            ],
+        )
 
+        # Reject invalid ports, invalid IPs, malformed URLs, and dedup / 10-bound
+        invalids = "nc bad.host 0 nc bad.host 65536 999.999.999.999:80 http://invalid:70000/ [invalid]:99999"
+        self.assertEqual(extract_service_targets(invalids), [])
+
+        # Dedup and max 10 bound
+        many = " ".join([f"10.0.0.{i}:8080" for i in range(15)] + ["10.0.0.1:8080"])
+        bounded = extract_service_targets(many)
+        self.assertEqual(len(bounded), 10)
+        self.assertEqual(len(set(bounded)), 10)
+
+    def test_inspect_challenge_files_missing_dir_with_service_and_tool_context(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing_dir = Path(td) / "missing"
+            desc = "Find the flag at https://chall.web.ctf/login or nc pwn.chall 9999"
+            inspection = inspect_challenge_files(missing_dir, description=desc, category="web")
+            self.assertEqual(len(inspection.file_summaries), 0)
+            self.assertEqual(
+                inspection.service_targets,
+                ["https://chall.web.ctf/login", "nc pwn.chall 9999"],
+            )
+            self.assertTrue(len(inspection.host_tools) > 0)
+            self.assertIn("https://chall.web.ctf/login", inspection.prompt_context)
+            self.assertIn("nc pwn.chall 9999", inspection.prompt_context)
+
+    def test_inspect_challenge_files_probe_exception_retains_targets(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            desc = "Target service at 127.0.0.1:1337"
+            with patch("webapp.target_inspector.probe_host_environment", side_effect=RuntimeError("probe failed")):
+                inspection = inspect_challenge_files(p, description=desc, category="misc")
+            self.assertEqual(inspection.service_targets, ["127.0.0.1:1337"])
+            self.assertEqual(inspection.host_tools, [])
+            self.assertIn("127.0.0.1:1337", inspection.prompt_context)
 
 class CapabilitySkillRoutingTests(unittest.TestCase):
     def setUp(self):
@@ -161,6 +236,8 @@ class CapabilitySkillRoutingTests(unittest.TestCase):
             "ghidra-headless-decompilation",
             "rizin-disassembly",
             "sagemath-crypto-solvers",
+            "web-exploitation-toolkit",
+            "pwntools-exploit-crafting",
             "apk-analysis",
         )
         self.catalog = [{"name": name} for name in names]

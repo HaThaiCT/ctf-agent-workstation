@@ -115,25 +115,21 @@ tcpflow -r "$PCAP" -o output/tcpflow 2>/dev/null
 foremost -i output/tcpflow/* -o output/carved 2>/dev/null
 ```
 
-## NTLM / Kerberos hash extraction
+## Authentication metadata (NTLM / Kerberos)
 
-The trip-up: the field names are non-obvious and the hashcat format is specific.
+Extract usernames, domains, and realms participating in authentication:
 
 ```bash
-# NTLMv2 — capture the four fields needed for hashcat mode 5600
+# NTLMv2 — extract authentication identities
 tshark -r "$PCAP" -Y "ntlmssp.messagetype == 0x00000003" -T fields \
   -e ntlmssp.auth.username -e ntlmssp.auth.domain \
-  -e ntlmssp.ntlmv2_response.ntproofstr \
-  -e ntlmssp.ntlmv2_response \
-  | tee output/ntlmv2_components.txt
+  | sort -u | tee output/ntlm_identities.txt
 
-# Kerberos AS-REQ → roasting candidates (hashcat mode 18200)
+# Kerberos AS-REQ — extract requested identities and realms
 tshark -r "$PCAP" -Y "kerberos.msg_type == 10" -T fields \
-  -e kerberos.CNameString -e kerberos.realm -e kerberos.cipher \
-  | tee output/kerberos_asreq.txt
+  -e kerberos.CNameString -e kerberos.realm \
+  | sort -u | tee output/kerberos_identities.txt
 ```
-
-Reassemble into hashcat format manually — the fields above are the inputs.
 
 ## Plaintext credentials (HTTP Basic, FTP, IMAP/POP3, Telnet)
 
@@ -174,18 +170,18 @@ for ip, ts in conns.items():
         print(f"BEACON {ip} count={len(ts)} avg={avg:.1f}s sd={sd:.1f}s")
 ```
 
-## Wireless (802.11) extraction
+## Wireless (802.11) frame analysis
 
-Only relevant if `protocol_hierarchy.txt` shows `wlan`. WPA handshakes for cracking:
+Only relevant if `protocol_hierarchy.txt` shows `wlan`. Extract probe requests, SSIDs, and management frames:
 
 ```bash
-# EAPOL frames (4-way handshake → hashcat mode 22000)
-tshark -r "$PCAP" -Y "eapol" -w output/eapol.pcap
-hcxpcapngtool -o output/wpa.hc22000 output/eapol.pcap 2>&1
+# EAPOL handshake frames presence
+tshark -r "$PCAP" -Y "eapol" -T fields -e frame.number -e wlan.sa -e wlan.da \
+  | tee output/eapol_frames.txt
 
 # Probe requests reveal device-history SSIDs
 tshark -r "$PCAP" -Y "wlan.fc.type_subtype == 0x04" -T fields \
-  -e wlan.sa -e wlan.ssid | sort -u
+  -e wlan.sa -e wlan.ssid | sort -u | tee output/probe_ssids.txt
 ```
 
 ## Custom dissection with scapy
@@ -210,4 +206,4 @@ binwalk "$F"
 # If clearly a stego candidate (PNG/BMP/JPEG/WAV), apply file-repair-and-stego skill.
 ```
 
-If multiple files need deeper analysis (LSB sweeps, stegseek bruteforce, OLE macro extraction), **stop and return the list** so the caller can spawn parallel `file-repair-and-stego` subagents.
+If multiple files need deeper analysis (LSB sweeps, stego extraction, OLE macro extraction), **stop and return the list** so the caller can spawn parallel `file-repair-and-stego` subagents.

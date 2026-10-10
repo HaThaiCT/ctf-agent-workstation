@@ -16,12 +16,9 @@ DEFAULT_OS_RELEASE = Path("/etc/os-release")
 FALLBACK_OS_RELEASE = Path("/usr/lib/os-release")
 
 DEFAULT_WORDLIST_CANDIDATES = [
-    Path("/usr/share/wordlists/rockyou.txt"),
-    Path("/usr/share/wordlists/rockyou.txt.gz"),
-    Path("/usr/share/wordlists"),
-    Path("/usr/share/seclists"),
-    Path("/usr/share/dirb/wordlists"),
-    Path("/usr/share/dirbuster/wordlists"),
+    Path("/usr/share/seclists/Discovery/Web-Content/common.txt"),
+    Path("/usr/share/dirb/wordlists/common.txt"),
+    Path("/usr/share/dirbuster/wordlists/directory-list-2.3-small.txt"),
 ]
 
 
@@ -46,6 +43,8 @@ class HostEnvironment:
     has_ghidra: bool = False
     has_sagemath: bool = False
     has_gdb_enhanced: bool = False
+    has_web_tools: bool = False
+    has_pwn_tools: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +55,8 @@ class HostEnvironment:
             "has_ghidra": self.has_ghidra,
             "has_sagemath": self.has_sagemath,
             "has_gdb_enhanced": self.has_gdb_enhanced,
+            "has_web_tools": self.has_web_tools,
+            "has_pwn_tools": self.has_pwn_tools,
         }
 
 
@@ -104,6 +105,8 @@ def _probe_binary_tool(
     candidates: list[str],
     version_args: list[str] | None = None,
     timeout: float = 3.0,
+    *,
+    probe_version: bool = True,
 ) -> ToolCapability:
     """Probe binary existence and version safely with timeout."""
     binary_path: str | None = None
@@ -124,6 +127,14 @@ def _probe_binary_tool(
             path="",
             version="",
             notes="Not found in PATH or standard locations",
+        )
+    if not probe_version:
+        return ToolCapability(
+            name=name,
+            available=True,
+            path=binary_path,
+            version="",
+            notes="",
         )
 
     args = [binary_path] + (version_args if version_args is not None else ["--version"])
@@ -281,7 +292,7 @@ def scan_available_wordlists(
     for p in paths_to_check:
         try:
             resolved = p.resolve()
-            if resolved.exists() and os.access(resolved, os.R_OK):
+            if resolved.is_file() and os.access(resolved, os.R_OK):
                 key = str(resolved)
                 if key not in seen:
                     seen.add(key)
@@ -310,7 +321,7 @@ def probe_host_environment(
     tools: dict[str, ToolCapability] = {}
 
     # Reverse engineering
-    tools["ghidra"] = _probe_binary_tool("ghidra", ["ghidra", "ghidraRun", "/usr/bin/ghidra", "/opt/ghidra/ghidraRun"], ["--help"])
+    tools["ghidra"] = _probe_binary_tool("ghidra", ["ghidra", "ghidraRun", "/usr/bin/ghidra", "/opt/ghidra/ghidraRun"], probe_version=False)
     tools["rizin"] = _probe_binary_tool("rizin", ["rizin", "/usr/bin/rizin"], ["-v"])
     tools["radare2"] = _probe_binary_tool("radare2", ["radare2", "r2", "/usr/bin/radare2", "/usr/bin/r2"], ["-v"])
     tools["objdump"] = _probe_binary_tool("objdump", ["objdump", "/usr/bin/objdump"], ["--version"])
@@ -324,7 +335,14 @@ def probe_host_environment(
     tools["one_gadget"] = _probe_binary_tool("one_gadget", ["one_gadget"], ["--version"])
     tools["seccomp-tools"] = _probe_binary_tool("seccomp-tools", ["seccomp-tools"], ["--version"])
     tools["checksec"] = _probe_binary_tool("checksec", ["checksec"], ["--version"])
+    tools["pwntools"] = _probe_python_module("pwntools", "pwn")
 
+    # Web
+    tools["sqlmap"] = _probe_binary_tool("sqlmap", ["sqlmap"], ["--version"])
+    tools["ffuf"] = _probe_binary_tool("ffuf", ["ffuf"], ["-V"])
+    tools["gobuster"] = _probe_binary_tool("gobuster", ["gobuster"], ["--version"])
+    tools["dirsearch"] = _probe_binary_tool("dirsearch", ["dirsearch"], ["--version"])
+    tools["nikto"] = _probe_binary_tool("nikto", ["nikto"], ["-Version"])
     # Crypto
     tools["sage"] = _probe_binary_tool("sage", ["sage", "/usr/bin/sage"], ["--version"])
     tools["z3"] = _probe_python_module("z3", "z3")
@@ -344,6 +362,12 @@ def probe_host_environment(
     has_gdb_enh = _check_gdb_enhanced(tools["gdb"])
     wordlists = scan_available_wordlists(wordlist_candidates)
 
+    web_tool_names = ("sqlmap", "ffuf", "gobuster", "dirsearch", "nikto")
+    has_web = any(tools.get(t) and tools[t].available for t in web_tool_names)
+
+    pwn_tool_names = ("gdb", "checksec", "ROPgadget", "ropper", "one_gadget", "seccomp-tools", "pwntools")
+    has_pwn = any(tools.get(t) and tools[t].available for t in pwn_tool_names)
+
     env = HostEnvironment(
         os_distro=distro,
         tools=tools,
@@ -352,9 +376,8 @@ def probe_host_environment(
         has_ghidra=has_ghidra,
         has_sagemath=has_sage,
         has_gdb_enhanced=has_gdb_enh,
+        has_web_tools=has_web,
+        has_pwn_tools=has_pwn,
     )
-
-    if os_release_path is None and wordlist_candidates is None:
-        _cached_env = env
 
     return env

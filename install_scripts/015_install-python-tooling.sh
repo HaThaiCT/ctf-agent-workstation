@@ -9,9 +9,9 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 # General Python packages used by the webapp, agents, and common CTF workflows.
 uv_pip_install \
-  pwntools ipython pycryptodome sympy z3-solver gmpy2 angr angrop unicorn zizmor \
+  pwntools ipython pycryptodome sympy z3-solver gmpy2 angr angrop claripy unicorn zizmor \
   starlette uvicorn python-multipart itsdangerous websockets httpx requests \
-  claude-agent-sdk google-auth
+  claude-agent-sdk google-auth "mcp>=2.3,<3" anyio
 
 # Fast Python developer/security tools installed as uv-managed command-line tools.
 uv_tool_install --force ruff

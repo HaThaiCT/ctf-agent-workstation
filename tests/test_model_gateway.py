@@ -344,5 +344,73 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
                 await self.gateway.catalog()
 
 
+    async def test_private_config_atomic_mode_and_secret_redaction(self):
+        dummy_key = "unit-secret-not-real"
+        self.gateway.save_config({"base_url": "https://gateway.test/v1", "api_key": dummy_key})
+        mode = self.path.stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+        config = self.gateway.load_config()
+        self.assertEqual(config.api_key, dummy_key)
+        self.assertNotIn(dummy_key, repr(config))
+        status = await self.gateway.public_status()
+        self.assertNotIn(dummy_key, json.dumps(status))
+        self.assertTrue(status["key_configured"])
+
+        # Save with blank key preserves the existing key and mode 0600
+        self.gateway.save_config({"base_url": "https://gateway.test/v1/updated", "api_key": ""})
+        self.assertEqual(self.gateway.load_config().api_key, dummy_key)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        content = json.loads(self.path.read_text())
+        self.assertEqual(content["claude"], {"legacy": "retained"})
+
+        # Atomic replacement failure leaves old file unchanged
+        with patch("os.replace", side_effect=OSError("simulated disk error")):
+            with self.assertRaises(OSError):
+                self.gateway.save_config({"base_url": "https://fail.test/v1", "api_key": "new-key"})
+        self.assertEqual(self.gateway.load_config().api_key, dummy_key)
+        self.assertEqual(self.gateway.load_config().base_url, "https://gateway.test/v1/updated")
+
+    async def test_codex_bundle_fallback_and_template_schemas(self):
+        # Canonical-only row
+        canonical_row = {
+            "slug": "canonical-model",
+            "model_messages": {"instructions_template": "Canonical instructions"},
+        }
+        # Legacy-only row
+        legacy_row = {
+            "slug": "legacy-model",
+            "base_instructions": "Legacy instructions",
+        }
+        # Invalid rows
+        invalid_rows = [
+            {"slug": ""},
+            {"slug": "no-instr"},
+            {"slug": "empty-instr", "base_instructions": "  "},
+            {"slug": "empty-canonical", "model_messages": {"instructions_template": ""}},
+            "not-a-dict",
+        ]
+        test_catalog = Path(self.temp.name) / "test-models.json"
+        test_catalog.write_text(json.dumps({"models": [canonical_row, legacy_row] + invalid_rows}))
+        parsed = ModelGateway._templates(test_catalog)
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed[0]["slug"], "canonical-model")
+        self.assertEqual(parsed[1]["slug"], "legacy-model")
+
+        # Bundle fallback when host sources missing
+        with self.client(
+            lambda request: httpx.Response(
+                200, json={"data": [model("cx/gpt-6.1-sol"), model("ag/claude-sonnet-4-6", "claude-adaptive")]}
+            )
+        ):
+            cat_models = await self.gateway.catalog(force_refresh=True)
+            runtime = await self.gateway.runtime("codex", {"model": "cx/gpt-6.1-sol", "effort": "medium"}, cat_models, POSITIVE_LEVELS)
+            self.assertTrue(Path(runtime.codex_catalog_path).is_file())
+            generated = json.loads(Path(runtime.codex_catalog_path).read_text())
+            gen_models = generated.get("models", [])
+            self.assertTrue(any(m["slug"] == "cx/gpt-6.1-sol" for m in gen_models))
+            sol_gen = next(m for m in gen_models if m["slug"] == "cx/gpt-6.1-sol")
+            self.assertIn("instructions_template", sol_gen.get("model_messages", {}))
+            self.assertEqual(sol_gen["default_reasoning_level"], "medium")
+
 if __name__ == "__main__":
     unittest.main()

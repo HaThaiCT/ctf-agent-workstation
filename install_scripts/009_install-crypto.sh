@@ -11,7 +11,6 @@ source "$SCRIPT_DIR/lib/common.sh"
 # Crypto tools: password cracking, CAS, and Python libraries
 #
 
-apt_install hashcat john
 
 # SageMath: install from conda-forge via Miniforge.
 MINIFORGE_DIR="/opt/miniforge3"
