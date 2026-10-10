@@ -83,20 +83,36 @@ Update `webapp/runtime_resources.py`:
   - If `category == "pwn"`, include `pwntools-exploit-crafting` and `craft-rop-chains-with-angrop`.
   - If `category in ("forensics", "crypto", "misc")` and challenge involves hashes/archives, include `hash-cracking-kali`.
 
-### Component 5: Kali Workstation Provisioning Script (`install_scripts/kali_setup.sh`)
+### Component 5: CTF Model Context Protocol (MCP) Expansion
+In addition to the existing `ctf_gdb` server (`mcps/gdb_mcp.py`), provide dedicated stdio MCP servers in `mcps/` to give agents structured tool calls for repetitive CTF tasks:
+
+1. **Activation of `ctf_gdb`**:
+   - Install `mcp` and `anyio` into the Python virtual environment alongside `gdb` via apt. This activates `ctf_gdb` automatically for Claude Code and Codex.
+2. **New `ctf_decoder` MCP Server (`mcps/decoder_mcp.py`)**:
+   - `decode_multiformat(data)`: Detects and decodes Base64, Base32, Base85, Hex, URL, HTML, Binary.
+   - `xor_bruteforce(data_hex, key_length=1)`: Brute-forces single-byte XOR keys and scores candidate outputs using ASCII frequency and flag regex.
+   - `rot_cipher(data, shift=13, mode="all")`: Solves Caesar / ROT rotations.
+   - `hash_identify(hash_str)`: Identifies hash type, bit length, and known format hints.
+3. **New `ctf_binary` MCP Server (`mcps/binary_mcp.py`)**:
+   - `binary_info(path)`: Binary architecture, endianness, bitness, and checksec protections.
+   - `binary_functions(path)`: Lists functions, entry points, and addresses using `rizin -q -c "aaa; aflj"`.
+   - `binary_disasm(path, target)`: Disassembles requested function or address via `rizin -q -c "aaa; pdf @ <target>"`.
+   - `binary_strings(path, min_len=4)`: Extracts printable strings from binary.
+4. **Registration in `webapp/runtime_resources.py`**:
+   - Extend `_builtin_mcp_servers()` to register `ctf_gdb`, `ctf_decoder`, and `ctf_binary`.
+   - Materialize these servers in each run's `.ctf-mcp.json` so Claude Code and Codex automatically load them.
+
+### Component 6: Kali Workstation Provisioning Script (`install_scripts/kali_setup.sh`)
 Create an idempotent, robust setup script specifically for Kali Linux:
-1. Ensure `node` symlink exists at `/usr/local/bin/node` and `~/.local/bin/node`.
+1. Ensure `node` and `npm` symlinks exist at `/usr/local/bin/node` and `~/.local/bin/node`.
 2. Install Kali CTF apt packages:
    `build-essential gdb ltrace strace binutils rizin radare2 ghidra sqlmap ffuf gobuster dirsearch john hashcat tshark binwalk foremost steghide ruby-dev wordlists python3-pwntools python3-venv python3-pip jq ripgrep tmux`.
 3. Auto-decompress `/usr/share/wordlists/rockyou.txt.gz` if `/usr/share/wordlists/rockyou.txt` does not exist.
 4. Set up Python virtual environment at `~/.local/share/ctf-agent-workstation/venv` using `uv venv`.
 5. Install webapp dependencies into the venv:
-   `starlette uvicorn python-multipart itsdangerous websockets httpx requests claude-agent-sdk pwntools z3-solver pycryptodome gmpy2 sympy scapy`.
+   `starlette uvicorn python-multipart itsdangerous websockets httpx requests mcp anyio claude-agent-sdk pwntools z3-solver pycryptodome gmpy2 sympy scapy`.
 6. Compile `ctfgrep` at `/usr/local/bin/ctfgrep`.
 7. Verify installation and print readiness summary.
-
----
-
 ## 3. Verification & Testing Plan
 
 1. **Unit Tests**:
