@@ -60,6 +60,16 @@ except ImportError:
     from runtime_resources import (skill_source_roots, bootstrap_skill_sources,
                                    select_automatic_skills, builtin_mcp_status,
                                    prepare_workspace_mcp)
+try:
+    from .tool_environment import probe_host_environment
+except ImportError:
+    from tool_environment import probe_host_environment
+try:
+    from .target_inspector import inspect_challenge_files
+except ImportError:
+    from target_inspector import inspect_challenge_files
+
+
 
 try:
     from .discord_bot import (
@@ -1045,6 +1055,20 @@ def setup_run_dir(challenge_id: str, run_id: str) -> Path:
     if shared_dir.exists() and not shared_link.exists():
         shared_link.symlink_to(shared_dir)
 
+    wordlists_candidates = [
+        Path("/usr/share/wordlists"),
+        Path("/usr/share/seclists"),
+    ]
+    wordlists_link = run_dir / "wordlists"
+    if not wordlists_link.exists() and not wordlists_link.is_symlink():
+        for wl in wordlists_candidates:
+            if wl.is_dir():
+                try:
+                    wordlists_link.symlink_to(wl)
+                    break
+                except OSError:
+                    pass
+
     return run_dir
 
 
@@ -1994,8 +2018,7 @@ def skill_catalog_by_name() -> dict[str, dict]:
 
 
 def default_enabled_skill_names() -> list[str]:
-    return select_automatic_skills({}, discover_skill_catalog())
-
+    return select_automatic_skills({}, discover_skill_catalog(), env=probe_host_environment())
 
 def _coerce_skill_list(value: object) -> list[str] | None:
     if value is None:
@@ -2243,10 +2266,9 @@ def challenge_skills_mode(challenge: dict, settings: dict | None = None) -> str:
 def challenge_enabled_skills(challenge: dict, settings: dict | None = None) -> list[str]:
     settings = settings or load_settings()
     if challenge_skills_mode(challenge, settings) == "auto":
-        return select_automatic_skills(challenge, discover_skill_catalog())
+        return select_automatic_skills(challenge, discover_skill_catalog(), env=probe_host_environment())
     requested = challenge.get("enabled_skills")
     return normalize_enabled_skills(requested if requested is not None else settings.get("enabled_skills"), default=[])
-
 
 def run_has_skill_override(run: dict) -> bool:
     return skills_mode(run, scope="run") != "inherit"
@@ -2255,7 +2277,7 @@ def run_has_skill_override(run: dict) -> bool:
 def run_enabled_skills(challenge: dict, run: dict, settings: dict | None = None) -> list[str]:
     mode = skills_mode(run, scope="run")
     if mode == "auto":
-        return select_automatic_skills(challenge, discover_skill_catalog())
+        return select_automatic_skills(challenge, discover_skill_catalog(), env=probe_host_environment())
     if mode == "manual":
         return normalize_enabled_skills(run.get("enabled_skills"), default=[])
     return challenge_enabled_skills(challenge, settings)
@@ -6216,6 +6238,7 @@ def _build_standard_prompt(
     team_placeholder: bool = False,
     remote_placeholder: bool = False,
     has_challenge_files: bool | None = None,
+    inspection_context: str = "",
 ) -> str:
     """Build the default CTF solving prompt without run-specific overrides."""
     is_parallel = challenge["mode"] == "parallel"
@@ -6285,6 +6308,9 @@ def _build_standard_prompt(
                 "formats like flag{{...}}, FLAG{{...}}, "
                 "CTF{{...}}, or ask."
             )
+
+    if inspection_context:
+        parts.extend(["", inspection_context])
     remote_context = (
         "{{REMOTE_INSTANCE_CONNECTION_INFO}}"
         if remote_placeholder
@@ -6370,7 +6396,13 @@ def load_instruction_prompt() -> str:
     return ""
 
 
-def build_prompt(challenge: dict, run: dict, instance_info: dict | None = None) -> str:
+def build_prompt(
+    challenge: dict,
+    run: dict,
+    instance_info: dict | None = None,
+    *,
+    inspection_context: str = "",
+) -> str:
     """Build the CTF solving prompt."""
     custom_prompt = str(run.get("custom_prompt") or "").strip()
     if custom_prompt and run.get("custom_prompt_mode") == "full":
@@ -6381,7 +6413,7 @@ def build_prompt(challenge: dict, run: dict, instance_info: dict | None = None) 
             instance_info,
         )
 
-    prompt = _build_standard_prompt(challenge, run, instance_info)
+    prompt = _build_standard_prompt(challenge, run, instance_info, inspection_context=inspection_context)
     if custom_prompt:
         prompt += "\n\nRun-specific instructions:\n" + custom_prompt
     return prompt
@@ -7248,6 +7280,15 @@ async def run_agent_task(
         await _run_ctfgrep_preflight(challenge_id, run_id, challenge, run, run_cwd)
         if run.get("status") == "solved" or challenge.get("status") == "solved":
             return
+    inspection_context = ""
+    if not continue_msg:
+        target_dir = run_cwd / "challenge_files" if (run_cwd / "challenge_files").is_dir() else run_cwd
+        try:
+            inspection = await asyncio.to_thread(inspect_challenge_files, target_dir)
+            inspection_context = inspection.prompt_context
+        except Exception as exc:
+            log.warning("[%s/%s] Pre-flight target inspection failed: %s", challenge_id[:8], run_id[:8], exc)
+            inspection_context = ""
 
     provider = get_provider(run["agent"])
 
@@ -7266,7 +7307,7 @@ async def run_agent_task(
             if conn_parts:
                 prompt += f"\n\nRemote instance: {', '.join(conn_parts)}"
     else:
-        prompt = build_prompt(challenge, run, instance_info)
+        prompt = build_prompt(challenge, run, instance_info, inspection_context=inspection_context)
 
     session_state_for_prompt = run.get("_session_state", {})
     has_session = bool(
@@ -7323,8 +7364,7 @@ async def run_agent_task(
                 "status": "solving",
             })
 
-            solve_prompt = build_prompt(challenge, run, instance_info)
-            prompt_event2 = {"type": "user_prompt", "message": solve_prompt}
+            solve_prompt = build_prompt(challenge, run, instance_info, inspection_context=inspection_context)
             if run.get("solve_start"):
                 prompt_event2["ts"] = run_elapsed_seconds(run)
             await _append_run_event(challenge_id, run_id, run, prompt_event2)
@@ -7810,6 +7850,13 @@ async def get_resources(request: Request) -> JSONResponse:
                          "mcp": [await asyncio.to_thread(builtin_mcp_status, REPO_ROOT_DIR)],
                          "category_catalog": dict(_category_catalog_status)})
 
+
+async def get_environment(request: Request) -> JSONResponse:
+    if err := require_same_origin(request):
+        return err
+    refresh = request.query_params.get("refresh") == "1"
+    env = await asyncio.to_thread(probe_host_environment, force_refresh=refresh)
+    return JSONResponse(env.to_dict())
 
 async def upload_skill(request: Request) -> JSONResponse:
     
@@ -12649,6 +12696,7 @@ routes = [
     Route("/api/swarm/instances/{name}", swarm_delete_instance, methods=["DELETE"]),
     Route("/api/skills", get_skills, methods=["GET"]),
     Route("/api/resources", get_resources, methods=["GET"]),
+    Route("/api/environment", get_environment, methods=["GET"]),
     Route("/api/skills/upload", upload_skill, methods=["POST"]),
     Route("/api/discord/test", discord_test, methods=["POST"]),
     Route("/api/discord/channels", discord_channels, methods=["POST"]),

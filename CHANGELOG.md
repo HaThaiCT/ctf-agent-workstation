@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Kali Linux CTF Solving Enhancements
+
+- Add host environment discovery module (`webapp/tool_environment.py`) detecting OS distro,
+  security tools (reverse, pwn, crypto, forensics), IDA license, and wordlists.
+- Add `GET /api/environment` endpoint exposing host environment capabilities.
+- Add pre-flight target inspector (`webapp/target_inspector.py`) extracting file magic,
+  ELF protections (checksec/readelf), archive listings, and pcap packet metadata into prompts.
+- Support capability-aware skill routing in `webapp/runtime_resources.py` with fallback to
+  Ghidra and Rizin when IDA license is absent, SageMath for crypto, and kernel GEF on kernel files.
+- Add built-in skill definitions for `ghidra-headless-decompilation`, `rizin-disassembly`,
+  and `sagemath-crypto-solvers`.
+- Automatically symlink standard wordlists (`/usr/share/wordlists` or `/usr/share/seclists`)
+  into agent workspace at `./wordlists/`.
+- Update `instruction.txt` with a 5-phase evidence-based CTF solving protocol and strict
+  anti-rabbit hole rule.
+- Add unit test suite in `tests/test_kali_environment.py`.
+
 ### Automatic Skills and MCP
 
 - Discover bundled/category/uploaded skills automatically without rebuilding or

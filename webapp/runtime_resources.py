@@ -14,6 +14,14 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+try:
+    from .tool_environment import HostEnvironment
+except ImportError:
+    try:
+        from tool_environment import HostEnvironment
+    except ImportError:
+        HostEnvironment = None  # type: ignore
+
 
 EXTERNAL_SKILLS_URL = "https://github.com/ljagiello/ctf-skills.git"
 MCP_CONFIG_FILE = ".ctf-mcp.json"
@@ -126,8 +134,43 @@ _CATEGORY_ALIASES = {
     "miscellaneous": "misc",
 }
 
+def _resolve_category_skills(category: str, env: HostEnvironment | None = None) -> tuple[str, ...]:
+    """Resolve skills for a category based on available host environment capabilities."""
+    if env is None:
+        return _CATEGORY_SKILLS.get(category, ())
 
-def select_automatic_skills(challenge: dict, catalog: list[dict]) -> list[str]:
+    if category in ("reverse", "malware"):
+        skills = ["ctf-reverse"] if category == "reverse" else ["ctf-malware"]
+        if env.has_ida_license:
+            skills.append("analyze-with-ida-domain-api")
+        else:
+            if env.has_ghidra:
+                skills.append("ghidra-headless-decompilation")
+            if env.tools.get("rizin") and env.tools["rizin"].available:
+                skills.append("rizin-disassembly")
+        return tuple(skills)
+
+    if category == "crypto":
+        skills = ["ctf-crypto"]
+        if env.has_sagemath:
+            skills.append("sagemath-crypto-solvers")
+        return tuple(skills)
+
+    if category == "pwn":
+        skills = ["ctf-pwn"]
+        if env.has_gdb_enhanced:
+            skills.append("kernel-gef-debugging")
+        skills.append("craft-rop-chains-with-angrop")
+        return tuple(skills)
+
+    return _CATEGORY_SKILLS.get(category, ())
+
+
+def select_automatic_skills(
+    challenge: dict,
+    catalog: list[dict],
+    env: HostEnvironment | None = None,
+) -> list[str]:
     """Select base/category/file skills; uncertain challenges expose category skills."""
     available = {entry["name"] for entry in catalog}
     selected = {
@@ -137,15 +180,22 @@ def select_automatic_skills(challenge: dict, catalog: list[dict]) -> list[str]:
     }
     category = _CATEGORY_ALIASES.get(str(challenge.get("category", "")).strip().lower())
     if category:
-        selected.update(_CATEGORY_SKILLS[category])
+        selected.update(_resolve_category_skills(category, env))
+
+    files = [str(name).lower() for name in challenge.get("files", [])]
+    has_kernel = any(any(kw in f for kw in ("vmlinuz", "bzimage", ".ko")) for f in files)
+    if has_kernel:
+        selected.add("kernel-gef-debugging")
+
     extensions = {Path(str(name)).suffix.lower() for name in challenge.get("files", [])}
     if extensions & {".apk", ".dex"}:
         selected.update(("apk-analysis", "ctf-reverse"))
     if extensions & {".pcap", ".pcapng", ".cap"}:
         selected.update(("pcap-extraction", "ctf-forensics"))
     if extensions & {".elf", ".exe", ".dll", ".so", ".bin"}:
-        selected.update(_CATEGORY_SKILLS["reverse"])
+        selected.update(_resolve_category_skills("reverse", env))
         selected.add("ctf-pwn")
+        selected.add("craft-rop-chains-with-angrop")
     if extensions & {".vmem", ".mem", ".dmp"}:
         selected.update(("volatility3-memdump", "ctf-forensics"))
     if extensions & {".img", ".vhd", ".vhdx", ".dd", ".e01"}:
@@ -154,10 +204,10 @@ def select_automatic_skills(challenge: dict, catalog: list[dict]) -> list[str]:
         selected.add("file-repair-and-stego")
     if not category and not (selected - {"ctf-methodology", "ground-your-findings"}):
         # Native skill descriptions permit on-demand discovery when category is unknown.
-        selected.update(name for names in _CATEGORY_SKILLS.values() for name in names)
+        for cat in _CATEGORY_SKILLS:
+            selected.update(_resolve_category_skills(cat, env))
         selected.add("apk-analysis")
     return sorted(selected & available)
-
 
 def builtin_mcp_status(repo_root: Path) -> dict:
     script = repo_root / "mcps/gdb_mcp.py"
