@@ -379,5 +379,8 @@ def probe_host_environment(
         has_web_tools=has_web,
         has_pwn_tools=has_pwn,
     )
+    if os_release_path is None and wordlist_candidates is None:
+        _cached_env = env
+
 
     return env

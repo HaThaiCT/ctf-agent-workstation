@@ -4314,6 +4314,50 @@ async def add_challenge_runs(request: Request) -> JSONResponse:
         "runs": added_runs,
     }, status_code=201)
 
+async def delete_challenge_run(request: Request) -> JSONResponse:
+    """Terminate and delete a specific run to free disk space and memory."""
+    if err := require_same_origin(request):
+        return err
+
+    challenge_id = request.path_params["id"]
+    run_id = request.path_params["run_id"]
+    challenge = challenges.get(challenge_id)
+    if not challenge:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    run = challenge.get("runs", {}).get(run_id)
+    if not run:
+        return JSONResponse({"error": "run not found"}, status_code=404)
+
+    try:
+        await stop_run(run, "deleted")
+    except Exception as exc:
+        log.warning("Failed to stop run %s on delete: %s", run_id, exc)
+
+    run_dir = CHALLENGES_DIR / challenge_id / "_runs" / run_id
+    if run_dir.exists():
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    clear_output_log(challenge_id, run_id)
+
+    await broadcast_challenge(challenge_id, {
+        "type": "run_deleted",
+        "challenge_id": challenge_id,
+        "run_id": run_id,
+    })
+
+    challenge["runs"].pop(run_id, None)
+    challenge["status"] = derive_challenge_status(challenge)
+    save_metadata(challenge)
+
+    await broadcast_global({
+        "type": "challenge_updated",
+        "challenge_id": challenge_id,
+        "challenge": public_challenge_summary(challenge),
+    })
+
+    return JSONResponse({"ok": True, "challenge_id": challenge_id, "run_id": run_id})
+
 
 async def broadcast_to_agents(request: Request) -> JSONResponse:
     """Broadcast a user message to all active runs as a breakthrough."""
@@ -12723,6 +12767,7 @@ routes = [
     Route("/api/challenges/{id}/solve", solve_challenge, methods=["POST"]),
     Route("/api/challenges/{id}/prompt-template", get_challenge_prompt_template, methods=["POST"]),
     Route("/api/challenges/{id}/runs", add_challenge_runs, methods=["POST"]),
+    Route("/api/challenges/{id}/runs/{run_id}", delete_challenge_run, methods=["DELETE"]),
     Route("/api/challenges/{id}/stop", stop_challenge, methods=["POST"]),
     Route("/api/challenges/{id}/broadcast", broadcast_to_agents, methods=["POST"]),
     Route("/api/challenges/{id}/steer", steer_challenge, methods=["POST"]),

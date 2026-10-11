@@ -360,5 +360,72 @@ class ApiEnvironmentTests(unittest.TestCase):
         self.assertIn("has_gdb_enhanced", data)
         self.assertIsInstance(data["tools"], dict)
 
+
+class ChallengeRunDeletionTests(unittest.TestCase):
+    def test_delete_challenge_run_frees_disk_and_updates_metadata(self):
+        from starlette.testclient import TestClient
+        from webapp import app as app_module
+
+        client = TestClient(app_module.app)
+        cid = "test_del_chall"
+        run_a_id = "run_a"
+        run_b_id = "run_b"
+
+        chall_dir = app_module.CHALLENGES_DIR / cid
+        run_a_dir = chall_dir / "_runs" / run_a_id
+        run_b_dir = chall_dir / "_runs" / run_b_id
+        run_a_dir.mkdir(parents=True, exist_ok=True)
+        run_b_dir.mkdir(parents=True, exist_ok=True)
+        (run_a_dir / "large_temp_file.bin").write_bytes(b"\x00" * 1024)
+
+        state_dir = app_module.challenge_state_dir(cid)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        jsonl_a = state_dir / f"{run_a_id}.jsonl"
+        jsonl_a.write_text('{"type": "system", "message": "hello"}\n')
+
+        run_a = app_module.make_run(run_a_id, "codex", "gpt-6.1", "medium", status="failed")
+        run_b = app_module.make_run(run_b_id, "claude", "sonnet", "", status="solving")
+        challenge = {
+            "id": cid,
+            "name": "Deletion Test Challenge",
+            "description": "test",
+            "category": "pwn",
+            "flag_format": "",
+            "mode": "parallel",
+            "status": "solving",
+            "created_at": "2026-10-10T00:00:00",
+            "files": [],
+            "runs": {run_a_id: run_a, run_b_id: run_b},
+        }
+        app_module.challenges[cid] = challenge
+        app_module.save_metadata(challenge)
+
+        try:
+            # Verify run_a exists before deletion
+            self.assertTrue(run_a_dir.exists())
+            self.assertTrue(jsonl_a.exists())
+
+            # Call DELETE endpoint
+            resp = client.delete(f"/api/challenges/{cid}/runs/{run_a_id}")
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(resp.json().get("ok"))
+
+            # Verify run_a is removed from in-memory challenge
+            self.assertNotIn(run_a_id, challenge["runs"])
+            self.assertIn(run_b_id, challenge["runs"])
+
+            # Verify workspace directory and JSONL log are removed from disk
+            self.assertFalse(run_a_dir.exists())
+            self.assertFalse(jsonl_a.exists())
+            self.assertTrue(run_b_dir.exists())
+
+            # Verify 404 for non-existent run
+            resp_404 = client.delete(f"/api/challenges/{cid}/runs/nonexistent")
+            self.assertEqual(resp_404.status_code, 404)
+        finally:
+            app_module.challenges.pop(cid, None)
+            import shutil
+            shutil.rmtree(chall_dir, ignore_errors=True)
+            shutil.rmtree(state_dir, ignore_errors=True)
 if __name__ == "__main__":
     unittest.main()

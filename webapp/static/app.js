@@ -1970,6 +1970,31 @@ async function stopRun(runId = "") {
   }
 }
 
+async function deleteRun(runId = "") {
+  if (!currentChallengeId) return;
+  const targetId = runId || (activeRunId && activeRunId !== "__default__" ? activeRunId : "");
+  if (!targetId) return;
+
+  const run = currentRuns.find((r) => r.id === targetId);
+  const meta = run ? getAgentMeta(run.agent) : null;
+  const label = run ? (runTabLabel(run, meta) || targetId) : targetId;
+
+  if (!confirm(`Xóa model/run "${label}" và toàn bộ dữ liệu workspace trên đĩa để giải phóng dung lượng?`)) {
+    return;
+  }
+
+  const res = await api(`/api/challenges/${currentChallengeId}/runs/${targetId}`, {
+    method: "DELETE",
+  });
+  if (res && res.ok) {
+    showToast(`Đã xóa model ${label} và giải phóng dung lượng`, "info");
+    await openChallenge(currentChallengeId);
+  } else if (res) {
+    const data = await res.json().catch(() => ({}));
+    showToast(data.error || "Không thể xóa run", "error");
+  }
+}
+
 $("#btn-stop").addEventListener("click", async () => {
   await stopRun();
 });
@@ -2115,6 +2140,9 @@ function connectGlobalWS() {
     }
     if (event.type === "swarm_event") {
       handleSwarmEvent(event);
+    }
+    if (event.type === "run_deleted" && event.challenge_id === currentChallengeId) {
+      openChallenge(currentChallengeId);
     }
   };
   globalWs.onclose = () => {
@@ -2908,12 +2936,15 @@ function initRunTabs(runs) {
     if (useSplit) {
       const pane = document.createElement("div");
       pane.className = "split-pane";
-      pane.innerHTML = `<div class="split-pane-header"><span class="run-tab-dot ${dotClass}"></span><span class="split-pane-title">${esc(label)}</span><span class="split-pane-actions"><button type="button" class="btn-ghost btn-xs split-skill-btn">Skills</button><button type="button" class="btn-danger btn-xs split-run-stop-btn" data-run="${esc(run.id)}">Stop</button></span></div>`;
+      pane.innerHTML = `<div class="split-pane-header"><span class="run-tab-dot ${dotClass}"></span><span class="split-pane-title">${esc(label)}</span><span class="split-pane-actions"><button type="button" class="btn-ghost btn-xs split-skill-btn">Skills</button><button type="button" class="btn-danger btn-xs split-run-stop-btn" data-run="${esc(run.id)}">Stop</button><button type="button" class="btn-ghost btn-xs text-danger split-run-delete-btn" data-run="${esc(run.id)}" title="Delete run & free disk space">Delete</button></span></div>`;
       pane.querySelector(".split-skill-btn").addEventListener("click", () => {
         openRunSkillsModal(run.id);
       });
       pane.querySelector(".split-run-stop-btn").addEventListener("click", () => {
         stopRun(run.id);
+      });
+      pane.querySelector(".split-run-delete-btn").addEventListener("click", () => {
+        deleteRun(run.id);
       });
       const feed = document.createElement("div");
       feed.id = `feed-${run.id}`;
@@ -2993,12 +3024,15 @@ function addRunTab(run) {
   } else {
     const pane = document.createElement("div");
     pane.className = "split-pane";
-    pane.innerHTML = `<div class="split-pane-header"><span class="run-tab-dot ${dotClass}"></span><span class="split-pane-title">${esc(label)}</span><span class="split-pane-actions"><button type="button" class="btn-ghost btn-xs split-skill-btn">Skills</button><button type="button" class="btn-danger btn-xs split-run-stop-btn" data-run="${esc(run.id)}">Stop</button></span></div>`;
+    pane.innerHTML = `<div class="split-pane-header"><span class="run-tab-dot ${dotClass}"></span><span class="split-pane-title">${esc(label)}</span><span class="split-pane-actions"><button type="button" class="btn-ghost btn-xs split-skill-btn">Skills</button><button type="button" class="btn-danger btn-xs split-run-stop-btn" data-run="${esc(run.id)}">Stop</button><button type="button" class="btn-ghost btn-xs text-danger split-run-delete-btn" data-run="${esc(run.id)}" title="Delete run & free disk space">Delete</button></span></div>`;
     pane.querySelector(".split-skill-btn").addEventListener("click", () => {
       openRunSkillsModal(run.id);
     });
     pane.querySelector(".split-run-stop-btn").addEventListener("click", () => {
       stopRun(run.id);
+    });
+    pane.querySelector(".split-run-delete-btn").addEventListener("click", () => {
+      deleteRun(run.id);
     });
     const feed = document.createElement("div");
     feed.id = `feed-${run.id}`;
@@ -3064,6 +3098,12 @@ function updateRunControlButtons() {
       && canStopRun(activeRun);
     activeStopBtn.classList.toggle("hidden", !showActiveStop);
     activeStopBtn.disabled = !showActiveStop;
+  }
+  const activeDeleteBtn = $("#btn-active-run-delete");
+  if (activeDeleteBtn) {
+    const hasRun = !!(activeRunId && activeRunId !== "__default__" && currentRuns.some((r) => r.id === activeRunId));
+    activeDeleteBtn.classList.toggle("hidden", !hasRun);
+    activeDeleteBtn.disabled = !hasRun;
   }
 
   document.querySelectorAll(".split-run-stop-btn").forEach((btn) => {
@@ -5471,6 +5511,12 @@ $("#btn-active-run-stop").addEventListener("click", () => {
     ? activeRunId
     : currentRuns[0]?.id;
   if (runId) stopRun(runId);
+});
+$("#btn-active-run-delete")?.addEventListener("click", () => {
+  const runId = activeRunId && activeRunId !== "__default__"
+    ? activeRunId
+    : currentRuns[0]?.id;
+  if (runId) deleteRun(runId);
 });
 $("#btn-add-run").addEventListener("click", openAddRunModal);
 $("#add-run-close").addEventListener("click", closeAddRunModal);
